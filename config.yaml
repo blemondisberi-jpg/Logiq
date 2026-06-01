@@ -5,7 +5,7 @@ bot:
   token: "${DISCORD_BOT_TOKEN}"
   prefix: "/"  # Slash commands only
   status: "online"
-  activity: "ALMIGHTY GUARDIAN OF THE THINKTWICE BASEMENT"
+  activity: "GUARDIAN OF THE THINKTWICE BASEMENT"
   activity_type: "watching"  # playing, watching, listening, streaming
 
 database:
