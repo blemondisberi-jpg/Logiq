@@ -10,12 +10,22 @@ import random
 import string
 from typing import Optional
 import logging
+from io import BytesIO
+
+import aiohttp
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from utils.embeds import EmbedFactory, EmbedColor
 from utils.permissions import is_admin
 from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
+DEFAULT_WELCOME_CARD_MESSAGE = "Hey {user}, Welcome to **{server}**!"
+DEFAULT_WELCOME_CARD_TITLE = "Welcome {display_name}"
+DEFAULT_WELCOME_CARD_SUBTITLE = "Member #{member_count}"
+DEFAULT_WELCOME_CARD_ACCENT = "#F5B8C7"
+DEFAULT_WELCOME_CARD_TEXT = "#F1C1CC"
+DEFAULT_WELCOME_CARD_SIZE = (1200, 520)
 
 
 class VerificationSetupModal(discord.ui.Modal, title="Verification Setup"):
@@ -47,6 +57,7 @@ class VerificationSetupModal(discord.ui.Modal, title="Verification Setup"):
         update_data = {
             'verified_role': self.role.id,
             'welcome_channel': self.welcome_channel.id,
+            'verification_enabled': True,
             'verification_type': self.verification_type,
             'verification_method': self.method,
             'welcome_message': self.welcome_message.value
@@ -126,6 +137,186 @@ class Verification(commands.Cog):
         self.db = db
         self.config = config
         self.module_config = config.get('modules', {}).get('verification', {})
+        self.session = None
+
+    def cog_unload(self):
+        """Cleanup resources on cog unload."""
+        if self.session and not self.session.closed:
+            self.bot.loop.create_task(self.session.close())
+
+    async def get_session(self):
+        """Get or create an aiohttp session."""
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+
+    def _render_text_template(self, template: Optional[str], context: dict, fallback: str) -> str:
+        """Render a text template safely using known placeholders."""
+        source = template or fallback
+        try:
+            return source.format(**context)
+        except KeyError as error:
+            missing = error.args[0]
+            logger.warning("Welcome template missing placeholder %s, falling back to default", missing)
+            return fallback.format(**context)
+
+    def _parse_hex_color(self, value: Optional[str], fallback: str) -> tuple[int, int, int]:
+        """Parse a hex color into an RGB tuple with fallback support."""
+        color_value = (value or fallback).strip().lstrip("#")
+        if len(color_value) != 6:
+            color_value = fallback.lstrip("#")
+        try:
+            return tuple(int(color_value[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            safe_fallback = fallback.lstrip("#")
+            return tuple(int(safe_fallback[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _is_valid_hex_color(self, value: str) -> bool:
+        """Check whether a color string is a valid 6-digit hex value."""
+        candidate = value.strip().lstrip("#")
+        if len(candidate) != 6:
+            return False
+        try:
+            int(candidate, 16)
+            return True
+        except ValueError:
+            return False
+
+    def _load_font(self, size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        """Load a font available in common Linux/macOS deploy environments."""
+        candidates = []
+        if bold:
+            candidates.extend([
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                "/Library/Fonts/Arial Bold.ttf"
+            ])
+        else:
+            candidates.extend([
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Arial.ttf"
+            ])
+
+        for path in candidates:
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    async def _fetch_url_image(self, url: str) -> Optional[Image.Image]:
+        """Fetch an image from a remote URL."""
+        session = await self.get_session()
+        try:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    logger.warning("Failed to fetch welcome card background %s: HTTP %s", url, response.status)
+                    return None
+                image_bytes = await response.read()
+        except aiohttp.ClientError as error:
+            logger.warning("Failed to fetch welcome card background %s: %s", url, error)
+            return None
+
+        try:
+            return Image.open(BytesIO(image_bytes)).convert("RGBA")
+        except OSError:
+            logger.warning("Fetched welcome card background is not a valid image: %s", url)
+            return None
+
+    async def _build_welcome_card(self, member: discord.Member, guild_config: dict) -> Optional[discord.File]:
+        """Generate a welcome card image for a joining member."""
+        width, height = DEFAULT_WELCOME_CARD_SIZE
+        accent = self._parse_hex_color(guild_config.get("welcome_card_accent_color"), DEFAULT_WELCOME_CARD_ACCENT)
+        text_color = self._parse_hex_color(guild_config.get("welcome_card_text_color"), DEFAULT_WELCOME_CARD_TEXT)
+        background_url = guild_config.get("welcome_card_background_url")
+
+        if background_url:
+            background = await self._fetch_url_image(background_url)
+            if background is None:
+                background = Image.new("RGBA", (width, height), (24, 24, 31, 255))
+            else:
+                background = ImageOps.fit(background, (width, height), method=Image.Resampling.LANCZOS)
+        else:
+            background = Image.new("RGBA", (width, height), (24, 24, 31, 255))
+
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        accent_soft = (*accent, 34)
+        accent_mid = (*accent, 70)
+        overlay_draw.ellipse((-220, -180, 560, 640), fill=accent_soft)
+        overlay_draw.ellipse((680, -240, 1460, 500), fill=(255, 255, 255, 18))
+        overlay_draw.ellipse((720, 160, 1420, 840), fill=accent_soft)
+        overlay_draw.arc((-180, -140, 680, 760), start=200, end=350, fill=accent_mid, width=40)
+        overlay_draw.arc((540, -220, 1340, 580), start=200, end=350, fill=(255, 255, 255, 30), width=28)
+        overlay_draw.arc((640, 120, 1500, 980), start=15, end=160, fill=accent_mid, width=42)
+        overlay = overlay.filter(ImageFilter.GaussianBlur(4))
+        canvas = Image.alpha_composite(background, overlay)
+
+        card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        card_draw = ImageDraw.Draw(card)
+        card_draw.rounded_rectangle((36, 36, width - 36, height - 36), radius=36, fill=(15, 16, 24, 235))
+        card_draw.rounded_rectangle((36, 36, width - 36, height - 36), radius=36, outline=(*accent, 70), width=3)
+        card = card.filter(ImageFilter.GaussianBlur(0))
+        canvas = Image.alpha_composite(canvas, card)
+
+        avatar_bytes = await member.display_avatar.replace(size=256).read()
+        avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA").resize((180, 180), Image.Resampling.LANCZOS)
+        avatar_mask = Image.new("L", (180, 180), 0)
+        ImageDraw.Draw(avatar_mask).ellipse((0, 0, 180, 180), fill=255)
+        avatar_circle = ImageOps.fit(avatar, (180, 180), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+        avatar_circle.putalpha(avatar_mask)
+
+        border = Image.new("RGBA", (210, 210), (0, 0, 0, 0))
+        ImageDraw.Draw(border).ellipse((0, 0, 210, 210), fill=(*accent, 255))
+        border.paste(avatar_circle, (15, 15), avatar_circle)
+
+        avatar_x = (width - 210) // 2
+        avatar_y = 96
+        canvas.paste(border, (avatar_x, avatar_y), border)
+
+        member_count = member.guild.member_count or len(member.guild.members)
+        context = {
+            "user": member.mention,
+            "username": member.name,
+            "display_name": member.display_name,
+            "server": member.guild.name,
+            "member_count": member_count
+        }
+        title_text = self._render_text_template(
+            guild_config.get("welcome_card_title"),
+            context,
+            DEFAULT_WELCOME_CARD_TITLE
+        )
+        subtitle_text = self._render_text_template(
+            guild_config.get("welcome_card_subtitle"),
+            context,
+            DEFAULT_WELCOME_CARD_SUBTITLE
+        )
+
+        draw = ImageDraw.Draw(canvas)
+        title_font = self._load_font(56, bold=True)
+        subtitle_font = self._load_font(34, bold=True)
+
+        title_bbox = draw.textbbox((0, 0), title_text, font=title_font)
+        subtitle_bbox = draw.textbbox((0, 0), subtitle_text, font=subtitle_font)
+        title_width = title_bbox[2] - title_bbox[0]
+        subtitle_width = subtitle_bbox[2] - subtitle_bbox[0]
+
+        title_position = ((width - title_width) / 2, 318)
+        subtitle_position = ((width - subtitle_width) / 2, 392)
+        shadow = (0, 0, 0, 130)
+        draw.text((title_position[0] + 2, title_position[1] + 2), title_text, font=title_font, fill=shadow)
+        draw.text(title_position, title_text, font=title_font, fill=text_color)
+        draw.text((subtitle_position[0] + 2, subtitle_position[1] + 2), subtitle_text, font=subtitle_font, fill=shadow)
+        draw.text(subtitle_position, subtitle_text, font=subtitle_font, fill=text_color)
+
+        output = BytesIO()
+        canvas.convert("RGB").save(output, format="PNG", quality=95)
+        output.seek(0)
+        return discord.File(output, filename="welcome-card.png")
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
@@ -155,24 +346,50 @@ class Verification(commands.Cog):
             # Replace channel name patterns with actual mentions
             welcome_message = welcome_message.replace(channel.name, channel.mention)
             welcome_message = welcome_message.replace(f"#{channel.name}", channel.mention)
-        
+
+        welcome_context = {
+            "user": member.mention,
+            "username": member.name,
+            "display_name": member.display_name,
+            "server": member.guild.name,
+            "member_count": member.guild.member_count or len(member.guild.members)
+        }
+
         # Send welcome message in welcome channel (PUBLIC - everyone can see)
         welcome_channel_id = guild_config.get('welcome_channel')
         if welcome_channel_id:
             welcome_channel = member.guild.get_channel(welcome_channel_id)
             if welcome_channel:
-                # Make sure everyone can see the welcome channel
-                welcome_embed = EmbedFactory.create(
-                    title=f"👋 Welcome to {member.guild.name}!",
-                    description=f"{member.mention}\n\n{welcome_message}",
-                    color=EmbedColor.SUCCESS
-                )
-                welcome_embed.set_thumbnail(url=member.display_avatar.url)
-                await welcome_channel.send(embed=welcome_embed)
-                logger.info(f"Sent welcome message for {member} in {welcome_channel}")
+                try:
+                    if guild_config.get("welcome_card_enabled", False):
+                        welcome_content = self._render_text_template(
+                            guild_config.get("welcome_card_message"),
+                            welcome_context,
+                            DEFAULT_WELCOME_CARD_MESSAGE
+                        )
+                        welcome_file = await self._build_welcome_card(member, guild_config)
+                        if welcome_file:
+                            await welcome_channel.send(content=welcome_content, file=welcome_file)
+                        else:
+                            raise RuntimeError("Failed to render welcome card")
+                    else:
+                        welcome_embed = EmbedFactory.create(
+                            title=f"👋 Welcome to {member.guild.name}!",
+                            description=f"{member.mention}\n\n{welcome_message}",
+                            color=EmbedColor.SUCCESS
+                        )
+                        welcome_embed.set_thumbnail(url=member.display_avatar.url)
+                        await welcome_channel.send(embed=welcome_embed)
+                    logger.info(f"Sent welcome message for {member} in {welcome_channel}")
+                except Exception as error:
+                    logger.error(f"Error sending welcome message for {member}: {error}", exc_info=True)
 
         # Send verification only if verified_role is configured
         if not verified_role_id:
+            return
+
+        if guild_config.get("verification_enabled", True) is False:
+            logger.info("Verification is disabled for %s; skipping join verification for %s", member.guild, member)
             return
 
         # Send verification to verify channel (if configured) - ONLY VISIBLE TO USER
@@ -301,6 +518,13 @@ class Verification(commands.Cog):
             )
             return
 
+        if guild_config.get("verification_enabled", True) is False:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Verification Disabled", "Verification is currently disabled for this server."),
+                ephemeral=True
+            )
+            return
+
         verified_role_id = guild_config.get('verified_role')
         if not verified_role_id:
             await interaction.response.send_message(
@@ -397,6 +621,204 @@ class Verification(commands.Cog):
         # Show modal to get welcome message
         modal = VerificationSetupModal(self, role, welcome_channel, method, verify_channel, verification_type)
         await interaction.response.send_modal(modal)
+
+    @app_commands.command(name="verification-status", description="View the current verification setup (Admin)")
+    @is_admin()
+    async def verification_status(self, interaction: discord.Interaction):
+        """Show the currently saved verification configuration."""
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config or not guild_config.get("verified_role"):
+            await interaction.response.send_message(
+                embed=EmbedFactory.info(
+                    "Verification Status",
+                    "Verification is not currently configured for this server."
+                ),
+                ephemeral=True
+            )
+            return
+
+        verified_role = interaction.guild.get_role(guild_config.get("verified_role"))
+        welcome_channel = interaction.guild.get_channel(guild_config.get("welcome_channel")) if guild_config.get("welcome_channel") else None
+        verify_channel = interaction.guild.get_channel(guild_config.get("verify_channel")) if guild_config.get("verify_channel") else None
+        verification_enabled = guild_config.get("verification_enabled", True)
+
+        embed = EmbedFactory.create(
+            title="🔐 Verification Status",
+            color=EmbedColor.INFO,
+            fields=[
+                {"name": "Enabled", "value": "Yes" if verification_enabled else "No", "inline": True},
+                {"name": "Method", "value": guild_config.get("verification_method", "dm"), "inline": True},
+                {"name": "Type", "value": guild_config.get("verification_type", "button"), "inline": True},
+                {"name": "Verified Role", "value": verified_role.mention if verified_role else "Missing role", "inline": False},
+                {"name": "Welcome Channel", "value": welcome_channel.mention if welcome_channel else "Not set", "inline": False},
+                {"name": "Verify Channel", "value": verify_channel.mention if verify_channel else "DM only / not set", "inline": False},
+                {
+                    "name": "Welcome Message",
+                    "value": (guild_config.get("welcome_message") or "Not set")[:250],
+                    "inline": False
+                },
+                {
+                    "name": "Note",
+                    "value": (
+                        "There is only one saved verification configuration per server. "
+                        "Running `/setup-verification` again updates that single config rather than creating a second background process. "
+                        "Any old verification messages already sent in channels are just normal messages and can be deleted manually."
+                    ),
+                    "inline": False
+                }
+            ]
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="verification-disable", description="Disable server verification (Admin)")
+    @is_admin()
+    async def verification_disable(self, interaction: discord.Interaction):
+        """Disable verification for future joins."""
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config or not guild_config.get("verified_role"):
+            await interaction.response.send_message(
+                embed=EmbedFactory.info("Verification Disabled", "Verification is not currently configured."),
+                ephemeral=True
+            )
+            return
+
+        await self.db.update_guild(interaction.guild.id, {
+            "verification_enabled": False,
+            "verified_role": None,
+            "verify_channel": None
+        })
+
+        await interaction.response.send_message(
+            embed=EmbedFactory.success(
+                "Verification Disabled",
+                "Future joins will no longer receive verification prompts. Existing verification messages already sent in channels will need to be deleted manually if you want them gone."
+            ),
+            ephemeral=True
+        )
+
+    @app_commands.command(name="welcome-card-config", description="Configure the join welcome card (Admin)")
+    @app_commands.describe(
+        channel="Optional welcome channel override",
+        enabled="Enable or disable welcome cards",
+        message="Text sent above the welcome image",
+        title="Main title on the welcome image",
+        subtitle="Subtitle on the welcome image",
+        accent_color="Accent hex color such as #F5B8C7",
+        text_color="Text hex color such as #F1C1CC",
+        background_image_url="Optional background image URL for the card"
+    )
+    @is_admin()
+    async def welcome_card_config(
+        self,
+        interaction: discord.Interaction,
+        channel: Optional[discord.TextChannel] = None,
+        enabled: Optional[bool] = None,
+        message: Optional[str] = None,
+        title: Optional[str] = None,
+        subtitle: Optional[str] = None,
+        accent_color: Optional[str] = None,
+        text_color: Optional[str] = None,
+        background_image_url: Optional[str] = None
+    ):
+        """Configure welcome card appearance and behavior."""
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(interaction.guild.id)
+
+        if accent_color is not None and not self._is_valid_hex_color(accent_color):
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Invalid Colour", "Accent color must be a 6-digit hex value such as `#F5B8C7`."),
+                ephemeral=True
+            )
+            return
+
+        if text_color is not None and not self._is_valid_hex_color(text_color):
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Invalid Colour", "Text color must be a 6-digit hex value such as `#F1C1CC`."),
+                ephemeral=True
+            )
+            return
+
+        update_data = {}
+        if channel is not None:
+            update_data["welcome_channel"] = channel.id
+        if enabled is not None:
+            update_data["welcome_card_enabled"] = enabled
+        if message is not None:
+            update_data["welcome_card_message"] = message
+        if title is not None:
+            update_data["welcome_card_title"] = title
+        if subtitle is not None:
+            update_data["welcome_card_subtitle"] = subtitle
+        if accent_color is not None:
+            update_data["welcome_card_accent_color"] = accent_color
+        if text_color is not None:
+            update_data["welcome_card_text_color"] = text_color
+        if background_image_url is not None:
+            update_data["welcome_card_background_url"] = background_image_url.strip() or None
+
+        if update_data:
+            await self.db.update_guild(interaction.guild.id, update_data)
+            guild_config.update(update_data)
+
+        embed = EmbedFactory.create(
+            title="🖼️ Welcome Card Settings",
+            color=EmbedColor.INFO,
+            fields=[
+                {"name": "Enabled", "value": "Yes" if guild_config.get("welcome_card_enabled", False) else "No", "inline": True},
+                {
+                    "name": "Welcome Channel",
+                    "value": (interaction.guild.get_channel(guild_config.get("welcome_channel")).mention if guild_config.get("welcome_channel") and interaction.guild.get_channel(guild_config.get("welcome_channel")) else "Not set"),
+                    "inline": True
+                },
+                {"name": "Accent Color", "value": guild_config.get("welcome_card_accent_color", DEFAULT_WELCOME_CARD_ACCENT), "inline": True},
+                {"name": "Text Color", "value": guild_config.get("welcome_card_text_color", DEFAULT_WELCOME_CARD_TEXT), "inline": True},
+                {"name": "Message", "value": (guild_config.get("welcome_card_message") or DEFAULT_WELCOME_CARD_MESSAGE)[:250], "inline": False},
+                {"name": "Title", "value": guild_config.get("welcome_card_title", DEFAULT_WELCOME_CARD_TITLE), "inline": False},
+                {"name": "Subtitle", "value": guild_config.get("welcome_card_subtitle", DEFAULT_WELCOME_CARD_SUBTITLE), "inline": False},
+                {
+                    "name": "Background Image",
+                    "value": guild_config.get("welcome_card_background_url") or "Using generated default background",
+                    "inline": False
+                },
+                {
+                    "name": "Placeholders",
+                    "value": "`{user}` `{username}` `{display_name}` `{server}` `{member_count}`",
+                    "inline": False
+                }
+            ]
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="welcome-card-preview", description="Preview the current welcome card (Admin)")
+    @is_admin()
+    async def welcome_card_preview(self, interaction: discord.Interaction):
+        """Preview the configured welcome card using the invoking admin."""
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(interaction.guild.id)
+
+        preview_file = await self._build_welcome_card(interaction.user, guild_config)
+        if not preview_file:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Preview Failed", "I couldn't generate the welcome card preview."),
+                ephemeral=True
+            )
+            return
+
+        context = {
+            "user": interaction.user.mention,
+            "username": interaction.user.name,
+            "display_name": interaction.user.display_name,
+            "server": interaction.guild.name,
+            "member_count": interaction.guild.member_count or len(interaction.guild.members)
+        }
+        welcome_content = self._render_text_template(
+            guild_config.get("welcome_card_message"),
+            context,
+            DEFAULT_WELCOME_CARD_MESSAGE
+        )
+        await interaction.response.send_message(content=welcome_content, file=preview_file, ephemeral=True)
 
     @app_commands.command(name="set-welcome-message", description="Set custom welcome DM message (Admin)")
     @app_commands.describe(message="Custom welcome message for new members")
