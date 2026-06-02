@@ -31,67 +31,6 @@ DEFAULT_WELCOME_CARD_SUBTITLE_SIZE = 44
 DEFAULT_VERIFICATION_MODE = "button"
 CAPTCHA_CODE_LENGTH = 6
 
-
-class VerificationSetupModal(discord.ui.Modal, title="Verification Setup"):
-    """Modal for setting up verification with welcome message"""
-
-    welcome_message = discord.ui.TextInput(
-        label="Welcome Message",
-        placeholder="Use {username} for name, {user} for @mention. Type channel names like: verify-channel",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=2000
-    )
-
-    def __init__(self, cog, role, welcome_channel, method, verify_channel, verification_type):
-        super().__init__()
-        self.cog = cog
-        self.role = role
-        self.welcome_channel = welcome_channel
-        self.method = method
-        self.verify_channel = verify_channel
-        self.verification_type = verification_type
-
-    async def on_submit(self, interaction: discord.Interaction):
-        """Handle modal submission"""
-        guild_config = await self.cog.db.get_guild(interaction.guild.id)
-        if not guild_config:
-            guild_config = await self.cog.db.create_guild(interaction.guild.id)
-
-        update_data = {
-            'verified_role': self.role.id,
-            'welcome_channel': self.welcome_channel.id,
-            'verification_enabled': True,
-            'verification_type': self.verification_type,
-            'rules_verification_mode': self.verification_type,
-            'verification_method': self.method,
-            'welcome_message': self.welcome_message.value
-        }
-        
-        if self.method == 'channel' and self.verify_channel:
-            update_data['verify_channel'] = self.verify_channel.id
-
-        await self.cog.db.update_guild(interaction.guild.id, update_data)
-
-        if self.method == 'channel':
-            method_text = f"**Verification Channel:** {self.verify_channel.mention}"
-            location_text = f"in {self.verify_channel.mention}"
-        else:
-            method_text = "**Method:** DM (Private Messages)"
-            location_text = "via DM"
-        
-        embed = EmbedFactory.success(
-            "✅ Verification Setup Complete",
-            f"**Verified Role:** {self.role.mention}\n"
-            f"**Welcome Channel:** {self.welcome_channel.mention}\n"
-            f"{method_text}\n"
-            f"**Type:** {self.verification_type}\n"
-            f"**Welcome Message:** {self.welcome_message.value[:100]}...\n\n"
-            f"New members will receive a welcome message in {self.welcome_channel.mention} and verification will be sent {location_text}."
-        )
-        await interaction.response.send_message(embed=embed)
-        logger.info(f"Verification setup completed in {interaction.guild} with method: {self.method}")
-
 logger = logging.getLogger(__name__)
 
 
@@ -912,51 +851,40 @@ class Verification(commands.Cog):
                 ephemeral=True
             )
 
-    @app_commands.command(name="setup-verification", description="Setup verification system (Admin)")
-    @app_commands.describe(
-        role="Role to assign upon verification",
-        welcome_channel="Channel to send welcome messages",
-        method="Verification method: 'dm' or 'channel'",
-        verify_channel="Channel for verification (REQUIRED if method is 'channel')",
-        verification_type="Type of verification (button/captcha). Also controls rules Accept flow when rules panel mode is enabled."
-    )
+    @app_commands.command(name="verification-role", description="Set the role granted after verification or rules acceptance (Admin)")
+    @app_commands.describe(role="Role to assign when a member completes verification")
     @is_admin()
-    async def setup_verification(
+    async def verification_role(
         self,
         interaction: discord.Interaction,
-        role: discord.Role,
-        welcome_channel: discord.TextChannel,
-        method: str,
-        verify_channel: Optional[discord.TextChannel] = None,
-        verification_type: str = "button"
+        role: discord.Role
     ):
-        """Setup verification system (ADMIN ONLY)"""
-        method = method.lower()
-        
-        if method not in ['dm', 'channel']:
+        """Set the verified role used by the rules panel and verification system."""
+        if role.is_default():
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Invalid Method", "Method must be 'dm' or 'channel'"),
-                ephemeral=True
-            )
-            return
-        
-        if method == 'channel' and not verify_channel:
-            await interaction.response.send_message(
-                embed=EmbedFactory.error("Missing Channel", "You must specify a verify_channel when using 'channel' method"),
-                ephemeral=True
-            )
-            return
-        
-        if verification_type not in ['button', 'captcha']:
-            await interaction.response.send_message(
-                embed=EmbedFactory.error("Invalid Type", "Verification type must be 'button' or 'captcha'"),
+                embed=EmbedFactory.error("Invalid Role", "Please choose a normal server role, not `@everyone`."),
                 ephemeral=True
             )
             return
 
-        # Show modal to get welcome message
-        modal = VerificationSetupModal(self, role, welcome_channel, method, verify_channel, verification_type)
-        await interaction.response.send_modal(modal)
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(interaction.guild.id)
+
+        await self.db.update_guild(interaction.guild.id, {
+            "verified_role": role.id,
+            "verification_enabled": True,
+            "verification_type": guild_config.get("verification_type", DEFAULT_VERIFICATION_MODE),
+            "rules_verification_mode": self._get_verification_mode(guild_config)
+        })
+
+        await interaction.response.send_message(
+            embed=EmbedFactory.success(
+                "Verification Role Updated",
+                f"Members who complete verification will now receive {role.mention}."
+            ),
+            ephemeral=True
+        )
 
     @app_commands.command(name="verification-status", description="View the current verification setup (Admin)")
     @is_admin()
@@ -1008,7 +936,8 @@ class Verification(commands.Cog):
                     "name": "Note",
                     "value": (
                         "There is only one saved verification configuration per server. "
-                        "Running `/setup-verification` again updates that single config rather than creating a second background process. "
+                        "Use `/verification-role` to set the role granted after verification, "
+                        "`/embed_rules verification:true` to post the rules gate, and `/verification-mode` to choose whether Accept verifies instantly or sends a DM captcha first. "
                         "If the rules panel is enabled, the Rules Accept Flow decides whether clicking Accept grants access instantly or sends a DM captcha first. "
                         "Any old verification messages already sent in channels are just normal messages and can be deleted manually."
                     ),
@@ -1235,7 +1164,7 @@ class Verification(commands.Cog):
         embed = EmbedFactory.success(
             "✅ Welcome Message Updated",
             f"**New Welcome Message:**\n{message}\n\n"
-            "This will be sent in DMs to new members along with the verification button."
+            "This will be sent in DMs to new members when the legacy DM verification flow is used."
         )
         await interaction.response.send_message(embed=embed)
         logger.info(f"Welcome message updated in {interaction.guild}")
@@ -1247,7 +1176,7 @@ class Verification(commands.Cog):
         guild_config = await self.db.get_guild(interaction.guild.id)
         if not guild_config or not guild_config.get('verified_role'):
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not Configured", "Please setup verification first with /setup-verification"),
+                embed=EmbedFactory.error("Not Configured", "Please set a verified role first with `/verification-role`."),
                 ephemeral=True
             )
             return

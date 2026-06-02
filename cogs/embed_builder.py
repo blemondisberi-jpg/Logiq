@@ -159,10 +159,10 @@ class EmbedBuilder(commands.Cog):
 
         guild_config = await self.db.get_guild(guild.id)
         if not guild_config or not guild_config.get("verified_role"):
-            return None, "Please run `/setup-verification` before attaching a verification button."
+            return None, "Please run `/verification-role` before attaching a verification button."
 
         if guild.get_role(guild_config["verified_role"]) is None:
-            return None, "The configured verified role no longer exists. Please rerun `/setup-verification`."
+            return None, "The configured verified role no longer exists. Please run `/verification-role` again."
 
         return VerificationButton(verification_cog), None
 
@@ -176,10 +176,10 @@ class EmbedBuilder(commands.Cog):
 
         guild_config = await self.db.get_guild(guild.id)
         if not guild_config or not guild_config.get("verified_role"):
-            return None, None, "Please run `/setup-verification` first so there is a verified role to grant."
+            return None, None, "Please run `/verification-role` first so there is a verified role to grant."
 
         if guild.get_role(guild_config["verified_role"]) is None:
-            return None, None, "The configured verified role no longer exists. Please rerun `/setup-verification`."
+            return None, None, "The configured verified role no longer exists. Please run `/verification-role` again."
 
         guild_config["rules_button_label"] = button_label
         return verification_cog.get_rules_accept_view(guild_config), verification_cog, None
