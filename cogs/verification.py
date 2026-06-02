@@ -28,6 +28,8 @@ DEFAULT_WELCOME_CARD_TEXT = "#F1C1CC"
 DEFAULT_WELCOME_CARD_SIZE = (1200, 520)
 DEFAULT_WELCOME_CARD_TITLE_SIZE = 74
 DEFAULT_WELCOME_CARD_SUBTITLE_SIZE = 44
+DEFAULT_VERIFICATION_MODE = "button"
+CAPTCHA_CODE_LENGTH = 6
 
 
 class VerificationSetupModal(discord.ui.Modal, title="Verification Setup"):
@@ -61,6 +63,7 @@ class VerificationSetupModal(discord.ui.Modal, title="Verification Setup"):
             'welcome_channel': self.welcome_channel.id,
             'verification_enabled': True,
             'verification_type': self.verification_type,
+            'rules_verification_mode': self.verification_type,
             'verification_method': self.method,
             'welcome_message': self.welcome_message.value
         }
@@ -122,16 +125,24 @@ class RulesAcceptView(discord.ui.View):
 
     async def accept_button(self, interaction: discord.Interaction):
         """Handle rules acceptance button click."""
-        await self.cog.verify_user(interaction, source="rules_accept")
+        await self.cog.handle_rules_accept(interaction)
 
 
 class CaptchaModal(discord.ui.Modal, title="Verification Captcha"):
     """Captcha verification modal"""
 
-    def __init__(self, correct_code: str, cog: 'Verification'):
+    def __init__(
+        self,
+        correct_code: str,
+        cog: 'Verification',
+        guild_id: Optional[int] = None,
+        source: str = "verification"
+    ):
         super().__init__()
         self.correct_code = correct_code
         self.cog = cog
+        self.guild_id = guild_id
+        self.source = source
 
     captcha_code = discord.ui.TextInput(
         label="Enter the code shown",
@@ -143,12 +154,52 @@ class CaptchaModal(discord.ui.Modal, title="Verification Captcha"):
     async def on_submit(self, interaction: discord.Interaction):
         """Handle captcha submission"""
         if self.captcha_code.value.upper() == self.correct_code:
-            await self.cog.verify_user(interaction)
+            await self.cog.verify_user(interaction, source=self.source, guild_id=self.guild_id)
         else:
-            await interaction.response.send_message(
+            await self.cog._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.error("Verification Failed", "Incorrect captcha code. Please try again."),
                 ephemeral=True
             )
+
+
+class CaptchaEntryView(discord.ui.View):
+    """View that lets a specific user open the captcha modal."""
+
+    def __init__(
+        self,
+        cog: 'Verification',
+        *,
+        user_id: int,
+        guild_id: int,
+        correct_code: str,
+        source: str = "verification"
+    ):
+        super().__init__(timeout=1800)
+        self.cog = cog
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.correct_code = correct_code
+        self.source = source
+
+    @discord.ui.button(label="Enter Code", style=discord.ButtonStyle.success, emoji="✅")
+    async def enter_code(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Open the code entry modal for the intended user."""
+        if interaction.user.id != self.user_id:
+            await self.cog._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Not For You", "This verification prompt belongs to another member."),
+                ephemeral=True
+            )
+            return
+
+        modal = CaptchaModal(
+            self.correct_code,
+            self.cog,
+            guild_id=self.guild_id,
+            source=self.source
+        )
+        await interaction.response.send_modal(modal)
 
 
 class Verification(commands.Cog):
@@ -173,6 +224,37 @@ class Verification(commands.Cog):
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
         return self.session
+
+    async def _send_interaction_embed(
+        self,
+        interaction: discord.Interaction,
+        *,
+        embed: discord.Embed,
+        ephemeral: bool = True
+    ) -> None:
+        """Respond to an interaction safely in guilds and DMs."""
+        response_kwargs = {"embed": embed}
+        if interaction.guild is not None:
+            response_kwargs["ephemeral"] = ephemeral
+
+        if interaction.response.is_done():
+            await interaction.followup.send(**response_kwargs)
+        else:
+            await interaction.response.send_message(**response_kwargs)
+
+    def _get_verification_mode(self, guild_config: dict) -> str:
+        """Get the current verification mode used after a member accepts rules."""
+        mode = (
+            guild_config.get("rules_verification_mode")
+            or guild_config.get("verification_type")
+            or DEFAULT_VERIFICATION_MODE
+        )
+        mode = str(mode).lower()
+        return mode if mode in {"button", "captcha"} else DEFAULT_VERIFICATION_MODE
+
+    def _generate_captcha_code(self) -> str:
+        """Generate a short verification code."""
+        return "".join(random.choices(string.ascii_uppercase + string.digits, k=CAPTCHA_CODE_LENGTH))
 
     def _render_text_template(self, template: Optional[str], context: dict, fallback: str) -> str:
         """Render a text template safely using known placeholders."""
@@ -221,7 +303,8 @@ class Verification(commands.Cog):
             "rules_image_url": image_url,
             "rules_footer": footer,
             "rules_button_label": button_label,
-            "verification_method": "rules_panel"
+            "verification_method": "rules_panel",
+            "rules_verification_mode": self._get_verification_mode(guild_config)
         }
         await self.db.update_guild(guild_id, update_data)
         guild_config.update(update_data)
@@ -254,6 +337,152 @@ class Verification(commands.Cog):
         if value is None:
             return fallback
         return max(24, min(140, int(value)))
+
+    async def _resolve_verification_context(
+        self,
+        interaction: discord.Interaction,
+        guild_id: Optional[int] = None
+    ) -> tuple[Optional[discord.Guild], Optional[discord.Member], Optional[dict]]:
+        """Resolve the guild, member, and config for guild or DM verification interactions."""
+        guild = interaction.guild
+        if guild is None and guild_id is not None:
+            guild = self.bot.get_guild(guild_id)
+
+        if guild is None:
+            return None, None, None
+
+        member = interaction.user if isinstance(interaction.user, discord.Member) else guild.get_member(interaction.user.id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(interaction.user.id)
+            except discord.HTTPException:
+                member = None
+
+        guild_config = await self.db.get_guild(guild.id)
+        return guild, member, guild_config
+
+    async def _send_rules_panel_captcha(self, interaction: discord.Interaction, guild_config: dict) -> None:
+        """Send the captcha challenge privately after a member accepts the rules panel."""
+        guild = interaction.guild
+        if guild is None:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Verification Error", "This rules acceptance button must be used inside the server."),
+                ephemeral=True
+            )
+            return
+
+        member = interaction.user if isinstance(interaction.user, discord.Member) else guild.get_member(interaction.user.id)
+        if member is None:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Verification Error", "I couldn't resolve your membership in this server."),
+                ephemeral=True
+            )
+            return
+
+        code = self._generate_captcha_code()
+        rules_channel = guild.get_channel(guild_config.get("rules_channel")) if guild_config.get("rules_channel") else None
+        button_label = self._get_rules_button_label(guild_config)
+
+        embed = EmbedFactory.create(
+            title=f"🔐 Complete Verification for {guild.name}",
+            description=(
+                "You've clicked the rules acceptance button.\n\n"
+                f"**Step 1:** Read this code: `{code}`\n"
+                "**Step 2:** Click the button below\n"
+                "**Step 3:** Enter the code to unlock the server"
+            ),
+            color=EmbedColor.PRIMARY,
+            footer=f"Triggered from {rules_channel.name}" if rules_channel else None
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        view = CaptchaEntryView(
+            self,
+            user_id=member.id,
+            guild_id=guild.id,
+            correct_code=code,
+            source="rules_accept_captcha"
+        )
+
+        try:
+            await member.send(embed=embed, view=view)
+        except discord.Forbidden:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error(
+                    "DMs Are Closed",
+                    (
+                        "I couldn't send you the captcha in DMs. Please enable direct messages from this server, "
+                        f"then click **{button_label}** again."
+                    )
+                ),
+                ephemeral=True
+            )
+            return
+        except Exception as error:
+            logger.error("Failed to send rules captcha DM to %s in %s: %s", member, guild, error, exc_info=True)
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Verification Error", "I couldn't send your captcha DM. Please try again in a moment."),
+                ephemeral=True
+            )
+            return
+
+        await self._send_interaction_embed(
+            interaction,
+            embed=EmbedFactory.info(
+                "Check Your DMs",
+                f"I've sent you a captcha in DMs. Complete it there to unlock **{guild.name}**."
+            ),
+            ephemeral=True
+        )
+
+    async def handle_rules_accept(self, interaction: discord.Interaction) -> None:
+        """Route rules acceptance into instant verification or DM captcha."""
+        guild, member, guild_config = await self._resolve_verification_context(interaction)
+        if guild is None or guild_config is None or member is None:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Verification Error", "I couldn't load this server's verification settings."),
+                ephemeral=True
+            )
+            return
+
+        verified_role_id = guild_config.get("verified_role")
+        if not verified_role_id:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Verification Unavailable", "No verified role is configured for this server."),
+                ephemeral=True
+            )
+            return
+
+        verified_role = guild.get_role(verified_role_id)
+        if verified_role is None:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Verification Unavailable", "The configured verified role no longer exists."),
+                ephemeral=True
+            )
+            return
+
+        if verified_role in member.roles:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.info("Already Verified", "You already have access to the server."),
+                ephemeral=True
+            )
+            return
+
+        mode = self._get_verification_mode(guild_config)
+        if mode == "captcha":
+            await self._send_rules_panel_captcha(interaction, guild_config)
+            return
+
+        await self.verify_user(interaction, source="rules_accept", guild_id=guild.id)
 
     def _load_font(self, size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         """Load a font available in common Linux/macOS deploy environments."""
@@ -414,7 +643,7 @@ class Verification(commands.Cog):
             return
 
         verified_role_id = guild_config.get('verified_role')
-        verification_type = guild_config.get('verification_type', 'button')
+        verification_type = self._get_verification_mode(guild_config)
         verification_method = guild_config.get('verification_method', 'dm')
         welcome_message_template = guild_config.get('welcome_message',
             f"Welcome to **{member.guild.name}**! 👋\n\n"
@@ -497,10 +726,10 @@ class Verification(commands.Cog):
                         msg = await verify_channel.send(embed=embed, view=view, delete_after=300)
                         logger.info(f"Sent verification to channel for {member}")
                     elif verification_type == 'captcha':
-                        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+                        code = self._generate_captcha_code()
                         
                         # Create a view with button that shows code only to the user
-                        class CaptchaView(discord.ui.View):
+                        class ChannelCaptchaView(discord.ui.View):
                             def __init__(self, user_id, verification_code, cog):
                                 super().__init__(timeout=None)
                                 self.user_id = user_id
@@ -515,10 +744,10 @@ class Verification(commands.Cog):
                                 await interaction.response.send_message(
                                     f"Your verification code: `{self.code}`\n\nClick the button below to enter it.",
                                     ephemeral=True,
-                                    view=CaptchaEntryView(self.user_id, self.code, self.cog)
+                                    view=ChannelCaptchaEntryView(self.user_id, self.code, self.cog)
                                 )
                         
-                        class CaptchaEntryView(discord.ui.View):
+                        class ChannelCaptchaEntryView(discord.ui.View):
                             def __init__(self, user_id, verification_code, cog):
                                 super().__init__(timeout=None)
                                 self.user_id = user_id
@@ -539,7 +768,7 @@ class Verification(commands.Cog):
                             color=EmbedColor.PRIMARY
                         )
                         
-                        view = CaptchaView(member.id, code, self)
+                        view = ChannelCaptchaView(member.id, code, self)
                         await verify_channel.send(embed=embed, view=view, delete_after=300)
                         logger.info(f"Sent captcha verification to channel for {member}")
                 except Exception as e:
@@ -559,27 +788,20 @@ class Verification(commands.Cog):
                 await member.send(embed=embed, view=view)
 
             elif verification_type == 'captcha':
-                code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+                code = self._generate_captcha_code()
                 embed = EmbedFactory.create(
                     title=f"🔐 Welcome to {member.guild.name}",
                     description=f"{welcome_message}\n\n**Your verification code:** `{code}`\n\nClick the button below and enter this code.",
                     color=EmbedColor.PRIMARY
                 )
                 embed.set_thumbnail(url=member.guild.icon.url if member.guild.icon else None)
-
-                button = discord.ui.Button(label="Enter Code", style=discord.ButtonStyle.green, custom_id=f"captcha_{member.id}")
-
-                async def captcha_callback(interaction: discord.Interaction):
-                    if interaction.user.id != member.id:
-                        await interaction.response.send_message("This verification is not for you!", ephemeral=True)
-                        return
-                    modal = CaptchaModal(code, self)
-                    await interaction.response.send_modal(modal)
-
-                button.callback = captcha_callback
-                view = discord.ui.View(timeout=None)
-                view.add_item(button)
-
+                view = CaptchaEntryView(
+                    self,
+                    user_id=member.id,
+                    guild_id=member.guild.id,
+                    correct_code=code,
+                    source="verification"
+                )
                 await member.send(embed=embed, view=view)
 
             logger.info(f"Sent DM verification to {member} in {member.guild}")
@@ -597,18 +819,25 @@ class Verification(commands.Cog):
                         )
                     )
 
-    async def verify_user(self, interaction: discord.Interaction, source: str = "verification"):
+    async def verify_user(
+        self,
+        interaction: discord.Interaction,
+        source: str = "verification",
+        guild_id: Optional[int] = None
+    ):
         """Verify a user and assign role (SILENT - no public announcements)"""
-        guild_config = await self.db.get_guild(interaction.guild.id)
-        if not guild_config:
-            await interaction.response.send_message(
+        guild, member, guild_config = await self._resolve_verification_context(interaction, guild_id)
+        if guild is None or member is None or guild_config is None:
+            await self._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.error("Error", "Server not configured"),
                 ephemeral=True
             )
             return
 
         if guild_config.get("verification_enabled", True) is False:
-            await interaction.response.send_message(
+            await self._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.error("Verification Disabled", "Verification is currently disabled for this server."),
                 ephemeral=True
             )
@@ -616,22 +845,25 @@ class Verification(commands.Cog):
 
         verified_role_id = guild_config.get('verified_role')
         if not verified_role_id:
-            await interaction.response.send_message(
+            await self._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.error("Error", "Verified role not configured"),
                 ephemeral=True
             )
             return
 
-        verified_role = interaction.guild.get_role(verified_role_id)
+        verified_role = guild.get_role(verified_role_id)
         if not verified_role:
-            await interaction.response.send_message(
+            await self._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.error("Error", "Verified role not found"),
                 ephemeral=True
             )
             return
 
-        if verified_role in interaction.user.roles:
-            await interaction.response.send_message(
+        if verified_role in member.roles:
+            await self._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.info("Already Verified", "You are already verified!"),
                 ephemeral=True
             )
@@ -639,22 +871,23 @@ class Verification(commands.Cog):
 
         try:
             # Silently add verified role
-            await interaction.user.add_roles(verified_role)
+            await member.add_roles(verified_role)
 
             # Send private success message
             success_title = "✅ Verified Successfully!"
             success_message = (
-                f"Welcome to **{interaction.guild.name}**!\n\n"
+                f"Welcome to **{guild.name}**!\n\n"
                 "You now have access to all channels."
             )
-            if source == "rules_accept":
+            if source in {"rules_accept", "rules_accept_captcha"}:
                 success_title = "✅ Rules Accepted!"
                 success_message = (
-                    f"You've accepted the rules for **{interaction.guild.name}**.\n\n"
-                    "You now have access to all channels."
+                    f"You've accepted the rules for **{guild.name}**.\n\n"
+                    "Your verification is complete and you now have access to all channels."
                 )
 
-            await interaction.response.send_message(
+            await self._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.success(
                     success_title,
                     success_message
@@ -663,16 +896,18 @@ class Verification(commands.Cog):
             )
 
             # Log silently (no public announcement)
-            logger.info(f"Verified user {interaction.user} in {interaction.guild} (silent) via {source}")
+            logger.info("Verified user %s in %s (silent) via %s", member, guild, source)
 
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await self._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.error("Error", "I don't have permission to assign roles"),
                 ephemeral=True
             )
-        except Exception as e:
-            logger.error(f"Error verifying user: {e}", exc_info=True)
-            await interaction.response.send_message(
+        except Exception as error:
+            logger.error("Error verifying user: %s", error, exc_info=True)
+            await self._send_interaction_embed(
+                interaction,
                 embed=EmbedFactory.error("Error", "An error occurred during verification"),
                 ephemeral=True
             )
@@ -683,7 +918,7 @@ class Verification(commands.Cog):
         welcome_channel="Channel to send welcome messages",
         method="Verification method: 'dm' or 'channel'",
         verify_channel="Channel for verification (REQUIRED if method is 'channel')",
-        verification_type="Type of verification (button/captcha)"
+        verification_type="Type of verification (button/captcha). Also controls rules Accept flow when rules panel mode is enabled."
     )
     @is_admin()
     async def setup_verification(
@@ -749,7 +984,8 @@ class Verification(commands.Cog):
             fields=[
                 {"name": "Enabled", "value": "Yes" if verification_enabled else "No", "inline": True},
                 {"name": "Method", "value": guild_config.get("verification_method", "dm"), "inline": True},
-                {"name": "Type", "value": guild_config.get("verification_type", "button"), "inline": True},
+                {"name": "Type", "value": guild_config.get("verification_type", DEFAULT_VERIFICATION_MODE), "inline": True},
+                {"name": "Rules Accept Flow", "value": self._get_verification_mode(guild_config), "inline": True},
                 {"name": "Rules Panel", "value": "Enabled" if guild_config.get("rules_panel_enabled", False) else "Disabled", "inline": True},
                 {"name": "Verified Role", "value": verified_role.mention if verified_role else "Missing role", "inline": False},
                 {"name": "Welcome Channel", "value": welcome_channel.mention if welcome_channel else "Not set", "inline": False},
@@ -773,6 +1009,7 @@ class Verification(commands.Cog):
                     "value": (
                         "There is only one saved verification configuration per server. "
                         "Running `/setup-verification` again updates that single config rather than creating a second background process. "
+                        "If the rules panel is enabled, the Rules Accept Flow decides whether clicking Accept grants access instantly or sends a DM captcha first. "
                         "Any old verification messages already sent in channels are just normal messages and can be deleted manually."
                     ),
                     "inline": False
@@ -780,6 +1017,39 @@ class Verification(commands.Cog):
             ]
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="verification-mode", description="Choose what happens after members click Accept (Admin)")
+    @app_commands.describe(mode="Use 'button' for instant access or 'captcha' to send a DM captcha after Accept")
+    @is_admin()
+    async def verification_mode(self, interaction: discord.Interaction, mode: str):
+        """Toggle the rules-panel follow-up flow between instant verify and DM captcha."""
+        mode = mode.lower().strip()
+        if mode not in {"button", "captcha"}:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Invalid Mode", "Mode must be `button` or `captcha`."),
+                ephemeral=True
+            )
+            return
+
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(interaction.guild.id)
+
+        await self.db.update_guild(interaction.guild.id, {
+            "verification_type": mode,
+            "rules_verification_mode": mode,
+            "verification_enabled": True
+        })
+
+        description = (
+            "Members who click the rules Accept button will now receive a captcha in DMs before they get access."
+            if mode == "captcha"
+            else "Members who click the rules Accept button will now be verified immediately."
+        )
+        await interaction.response.send_message(
+            embed=EmbedFactory.success("Verification Mode Updated", description),
+            ephemeral=True
+        )
 
     @app_commands.command(name="verification-disable", description="Disable server verification (Admin)")
     @is_admin()
