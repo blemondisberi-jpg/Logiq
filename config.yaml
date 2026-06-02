@@ -93,6 +93,8 @@ redis:
 api_keys:
   openai: ""
   anthropic: ""
+  twitch_client_id: ""
+  twitch_client_secret: ""
   youtube: ""
   spotify_client_id: ""
   spotify_client_secret: ""
