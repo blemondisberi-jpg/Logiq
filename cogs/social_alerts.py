@@ -175,7 +175,8 @@ class SocialAlerts(commands.Cog):
             "last_content_id": None
         }
 
-        await self.db.db.social_alerts.insert_one(alert_data)
+        result = await self.db.db.social_alerts.insert_one(alert_data)
+        alert_data["_id"] = result.inserted_id
 
         platform_emoji = {
             "twitch": "🟣",
@@ -192,6 +193,13 @@ class SocialAlerts(commands.Cog):
             f"**Custom Message:**\n{template_preview}\n\n"
             f"You'll be notified when {username} {'goes live' if platform == 'twitch' else 'posts new content'}!"
         )
+        if platform == "twitch":
+            await self.check_twitch(alert_data)
+            embed.add_field(
+                name="Initial Check",
+                value="Ran an immediate Twitch status check for this alert.",
+                inline=False
+            )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         logger.info("%s added %s alert for %s", interaction.user, platform, username)
 
@@ -487,6 +495,16 @@ class SocialAlerts(commands.Cog):
     async def check_twitter(self, alert: dict):
         """Check Twitter/X for new tweets."""
         logger.debug("Checking Twitter for %s", alert["username"])
+
+    async def _run_single_alert_check(self, alert: dict) -> None:
+        """Run one alert check immediately."""
+        platform = alert["platform"]
+        if platform == "twitch":
+            await self.check_twitch(alert)
+        elif platform == "youtube":
+            await self.check_youtube(alert)
+        elif platform == "twitter":
+            await self.check_twitter(alert)
 
     @app_commands.command(name="alert-add", description="Add social media alert (Admin)")
     @app_commands.describe(
@@ -831,6 +849,53 @@ class SocialAlerts(commands.Cog):
             fields=fields
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="alert-run", description="Run a social media alert check immediately (Admin)")
+    @app_commands.describe(
+        platform="Platform (twitch/youtube/twitter)",
+        username="Username to check now"
+    )
+    @is_admin()
+    async def run_alert(
+        self,
+        interaction: discord.Interaction,
+        platform: str,
+        username: str
+    ):
+        """Force an alert check immediately."""
+        platform = platform.lower()
+        if platform not in SUPPORTED_PLATFORMS:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, or twitter"),
+                ephemeral=True
+            )
+            return
+
+        alert = await self.db.db.social_alerts.find_one({
+            "guild_id": interaction.guild.id,
+            "platform": platform,
+            "username": username.lower()
+        })
+        if not alert:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Not Found", f"No alert found for {username} on {platform}"),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await self._run_single_alert_check(alert)
+
+        refreshed = await self.db.db.social_alerts.find_one({"_id": alert["_id"]})
+        status = refreshed.get("last_check_status", "unknown")
+        error = refreshed.get("last_check_error") or "None"
+        embed = EmbedFactory.success(
+            "Alert Check Complete",
+            f"Ran an immediate check for **{username}** on **{platform}**.\n\n"
+            f"**Last Status:** {status}\n"
+            f"**Last Error:** {error}"
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
         platform_data = {
             "youtube": {

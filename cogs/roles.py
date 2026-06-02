@@ -10,7 +10,7 @@ from typing import Optional, List
 import logging
 
 from utils.embeds import EmbedFactory, EmbedColor
-from utils.permissions import is_admin
+from utils.permissions import is_admin, PermissionChecker
 from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -332,6 +332,143 @@ class Roles(commands.Cog):
         # Views are automatically re-registered when messages are loaded
         logger.info("Role menu persistent views ready")
 
+    def _get_bot_member(self, guild: discord.Guild) -> Optional[discord.Member]:
+        """Get the bot's guild member object."""
+        return guild.me or guild.get_member(self.bot.user.id)
+
+    def _can_manage_role(self, actor: discord.Member, role: discord.Role) -> tuple[bool, Optional[str]]:
+        """Check whether a member can manage a specific role."""
+        if role.is_default():
+            return False, "The `@everyone` role cannot be mass-managed."
+        if role.is_integration() or role.managed:
+            return False, "Managed or integration roles cannot be mass-managed."
+        if actor.guild.owner_id == actor.id:
+            return True, None
+        if actor.top_role <= role:
+            return False, "That role is higher than or equal to your highest role."
+        return True, None
+
+    async def _mass_role_update(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        *,
+        mode: str,
+        skip_bots: bool,
+        confirm: bool
+    ):
+        """Add or remove a role for many members with safety checks."""
+        if not confirm:
+            action = "add" if mode == "add" else "remove"
+            await interaction.response.send_message(
+                embed=EmbedFactory.warning(
+                    "Confirmation Required",
+                    f"This command affects many members. Re-run it with `confirm:true` to {action} {role.mention} {'to' if mode == 'add' else 'from'} all eligible members."
+                ),
+                ephemeral=True
+            )
+            return
+
+        actor = interaction.user
+        bot_member = self._get_bot_member(interaction.guild)
+        if bot_member is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Error", "I couldn't resolve my bot member in this server."),
+                ephemeral=True
+            )
+            return
+
+        if not bot_member.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Missing Permissions", "I need the **Manage Roles** permission to do that."),
+                ephemeral=True
+            )
+            return
+
+        actor_can_manage, actor_error = self._can_manage_role(actor, role)
+        if not actor_can_manage:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Role Hierarchy", actor_error),
+                ephemeral=True
+            )
+            return
+
+        bot_can_manage, bot_error = self._can_manage_role(bot_member, role)
+        if not bot_can_manage:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Role Hierarchy", f"I can't manage {role.mention}. {bot_error}"),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        stats = {
+            "processed": 0,
+            "changed": 0,
+            "already": 0,
+            "missing": 0,
+            "skipped_bots": 0,
+            "skipped_hierarchy": 0,
+            "failed": 0
+        }
+
+        reason = f"Mass role {mode} by {interaction.user} ({interaction.user.id})"
+        for member in interaction.guild.members:
+            if member.bot and skip_bots:
+                stats["skipped_bots"] += 1
+                continue
+
+            if not PermissionChecker.check_hierarchy(bot_member, member):
+                stats["skipped_hierarchy"] += 1
+                continue
+
+            has_role = role in member.roles
+            if mode == "add" and has_role:
+                stats["already"] += 1
+                continue
+            if mode == "remove" and not has_role:
+                stats["missing"] += 1
+                continue
+
+            try:
+                if mode == "add":
+                    await member.add_roles(role, reason=reason)
+                else:
+                    await member.remove_roles(role, reason=reason)
+                stats["changed"] += 1
+                stats["processed"] += 1
+            except discord.Forbidden:
+                stats["failed"] += 1
+            except discord.HTTPException:
+                stats["failed"] += 1
+
+        title = "Mass Role Add Complete" if mode == "add" else "Mass Role Remove Complete"
+        verb = "added to" if mode == "add" else "removed from"
+        embed = EmbedFactory.create(
+            title=f"✅ {title}",
+            color=EmbedColor.SUCCESS,
+            fields=[
+                {"name": "Role", "value": role.mention, "inline": True},
+                {"name": "Action", "value": verb, "inline": True},
+                {"name": "Changed", "value": str(stats["changed"]), "inline": True},
+                {"name": "Already Had Role", "value": str(stats["already"]), "inline": True},
+                {"name": "Didn't Have Role", "value": str(stats["missing"]), "inline": True},
+                {"name": "Skipped Bots", "value": str(stats["skipped_bots"]), "inline": True},
+                {"name": "Skipped Hierarchy", "value": str(stats["skipped_hierarchy"]), "inline": True},
+                {"name": "Failed", "value": str(stats["failed"]), "inline": True}
+            ]
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.info(
+            "%s ran mass role %s for %s in %s: %s",
+            interaction.user,
+            mode,
+            role,
+            interaction.guild,
+            stats
+        )
+
     @app_commands.command(name="create-role-menu", description="Create a role menu (Admin)")
     @app_commands.describe(
         title="Title of the role menu",
@@ -475,6 +612,29 @@ class Roles(commands.Cog):
                 ephemeral=True
             )
 
+    @app_commands.command(name="massrole-add", description="Add a role to all eligible members (Admin)")
+    @app_commands.describe(
+        role="Role to add",
+        skip_bots="Skip bot accounts (recommended)",
+        confirm="Must be true to actually run"
+    )
+    @is_admin()
+    async def massrole_add(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        skip_bots: bool = True,
+        confirm: bool = False
+    ):
+        """Add a role to all eligible members."""
+        await self._mass_role_update(
+            interaction,
+            role,
+            mode="add",
+            skip_bots=skip_bots,
+            confirm=confirm
+        )
+
     @app_commands.command(name="removerole", description="Remove a role from a user (Admin)")
     @app_commands.describe(user="User to remove role from", role="Role to remove")
     @is_admin()
@@ -497,6 +657,29 @@ class Roles(commands.Cog):
                 embed=EmbedFactory.error("Error", "I don't have permission to manage roles"),
                 ephemeral=True
             )
+
+    @app_commands.command(name="massrole-remove", description="Remove a role from all eligible members (Admin)")
+    @app_commands.describe(
+        role="Role to remove",
+        skip_bots="Skip bot accounts (recommended)",
+        confirm="Must be true to actually run"
+    )
+    @is_admin()
+    async def massrole_remove(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        skip_bots: bool = True,
+        confirm: bool = False
+    ):
+        """Remove a role from all eligible members."""
+        await self._mass_role_update(
+            interaction,
+            role,
+            mode="remove",
+            skip_bots=skip_bots,
+            confirm=confirm
+        )
 
 
 async def setup(bot: commands.Bot):
