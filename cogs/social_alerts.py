@@ -54,10 +54,7 @@ class SocialAlertTemplateModal(discord.ui.Modal):
 
         self.message_template = discord.ui.TextInput(
             label="Announcement Message",
-            placeholder=(
-                "Use {display_name}, {url}, {title}, {everyone}, etc.\n"
-                "Discord markdown like **bold** and __underline__ works here."
-            ),
+            placeholder="Use {display_name}, {url}, {title}, {everyone}. Discord markdown works here.",
             style=discord.TextStyle.paragraph,
             required=False,
             default=default_value,
@@ -527,8 +524,18 @@ class SocialAlerts(commands.Cog):
             )
             return
 
-        modal = SocialAlertTemplateModal(self, platform, username, channel, mode="create")
-        await interaction.response.send_modal(modal)
+        try:
+            modal = SocialAlertTemplateModal(self, platform, username, channel, mode="create")
+            await interaction.response.send_modal(modal)
+        except Exception as error:
+            logger.error("Failed to open social alert create modal: %s", error, exc_info=True)
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Setup Failed",
+                    "I couldn't open the alert setup wizard. Please try again."
+                ),
+                ephemeral=True
+            )
 
     @app_commands.command(name="alert-edit", description="Edit an existing social media alert (Admin)")
     @app_commands.describe(
@@ -565,15 +572,25 @@ class SocialAlerts(commands.Cog):
             )
             return
 
-        modal = SocialAlertTemplateModal(
-            self,
-            platform,
-            username,
-            channel,
-            mode="edit",
-            existing_alert=alert
-        )
-        await interaction.response.send_modal(modal)
+        try:
+            modal = SocialAlertTemplateModal(
+                self,
+                platform,
+                username,
+                channel,
+                mode="edit",
+                existing_alert=alert
+            )
+            await interaction.response.send_modal(modal)
+        except Exception as error:
+            logger.error("Failed to open social alert edit modal: %s", error, exc_info=True)
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Setup Failed",
+                    "I couldn't open the alert edit wizard. Please try again."
+                ),
+                ephemeral=True
+            )
 
     @app_commands.command(name="alert-remove", description="Remove social media alert (Admin)")
     @app_commands.describe(
