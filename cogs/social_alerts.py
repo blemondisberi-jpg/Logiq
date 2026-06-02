@@ -27,6 +27,68 @@ DEFAULT_ALERT_TEMPLATE = (
 TWITCH_EMBED_COLOR = 0x9146FF
 
 
+class SocialAlertTemplateModal(discord.ui.Modal):
+    """Modal for writing multi-line social alert templates."""
+
+    def __init__(
+        self,
+        cog: "SocialAlerts",
+        platform: str,
+        username: str,
+        channel: Optional[discord.TextChannel],
+        mode: str,
+        existing_alert: Optional[dict] = None
+    ):
+        title = "Create Social Alert" if mode == "create" else "Edit Social Alert"
+        super().__init__(title=title)
+        self.cog = cog
+        self.platform = platform
+        self.username = username
+        self.channel = channel
+        self.mode = mode
+        self.existing_alert = existing_alert
+
+        default_value = None
+        if existing_alert:
+            default_value = existing_alert.get("message_template") or DEFAULT_ALERT_TEMPLATE
+
+        self.message_template = discord.ui.TextInput(
+            label="Announcement Message",
+            placeholder=(
+                "Use {display_name}, {url}, {title}, {everyone}, etc.\n"
+                "Discord markdown like **bold** and __underline__ works here."
+            ),
+            style=discord.TextStyle.paragraph,
+            required=False,
+            default=default_value,
+            max_length=2000
+        )
+        self.add_item(self.message_template)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Persist the alert after the modal is submitted."""
+        template_value = self.message_template.value.strip()
+        message_template = template_value or None
+
+        if self.mode == "create":
+            await self.cog._create_alert_record(
+                interaction,
+                self.platform,
+                self.username,
+                self.channel,
+                message_template
+            )
+        else:
+            await self.cog._update_alert_record(
+                interaction,
+                self.platform,
+                self.username,
+                self.channel,
+                message_template,
+                self.existing_alert
+            )
+
+
 class SocialAlerts(commands.Cog):
     """Social media alerts cog"""
 
@@ -68,6 +130,103 @@ class SocialAlerts(commands.Cog):
             logger.warning("Alert template missing placeholder %s, falling back to default template", missing)
             return DEFAULT_ALERT_TEMPLATE.format(**context)
 
+    def _format_alert_preview(self, message_template: Optional[str]) -> str:
+        """Format the saved template for confirmations."""
+        return message_template or DEFAULT_ALERT_TEMPLATE
+
+    async def _save_alert_check_state(
+        self,
+        alert_id,
+        *,
+        status: str,
+        error: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        stream_title: Optional[str] = None,
+        stream_started_at: Optional[str] = None
+    ) -> None:
+        """Persist the latest Twitch check status for diagnostics."""
+        update_data = {
+            "last_check": discord.utils.utcnow().timestamp(),
+            "last_check_status": status,
+            "last_check_error": error
+        }
+        if stream_id is not None:
+            update_data["last_content_id"] = stream_id
+        if stream_title is not None:
+            update_data["last_stream_title"] = stream_title
+        if stream_started_at is not None:
+            update_data["last_stream_started_at"] = stream_started_at
+
+        await self.db.db.social_alerts.update_one({"_id": alert_id}, {"$set": update_data})
+
+    async def _create_alert_record(
+        self,
+        interaction: discord.Interaction,
+        platform: str,
+        username: str,
+        channel: discord.TextChannel,
+        message_template: Optional[str]
+    ) -> None:
+        """Create an alert record and confirm success."""
+        alert_data = {
+            "guild_id": interaction.guild.id,
+            "channel_id": channel.id,
+            "platform": platform,
+            "username": username.lower(),
+            "message_template": message_template,
+            "last_check": None,
+            "last_content_id": None
+        }
+
+        await self.db.db.social_alerts.insert_one(alert_data)
+
+        platform_emoji = {
+            "twitch": "🟣",
+            "youtube": "🔴",
+            "twitter": "🐦"
+        }
+        template_preview = self._format_alert_preview(message_template)
+
+        embed = EmbedFactory.success(
+            "Alert Added",
+            f"{platform_emoji.get(platform, '📢')} **{platform.title()}** alert added!\n\n"
+            f"**Username:** {username}\n"
+            f"**Channel:** {channel.mention}\n"
+            f"**Custom Message:**\n{template_preview}\n\n"
+            f"You'll be notified when {username} {'goes live' if platform == 'twitch' else 'posts new content'}!"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        logger.info("%s added %s alert for %s", interaction.user, platform, username)
+
+    async def _update_alert_record(
+        self,
+        interaction: discord.Interaction,
+        platform: str,
+        username: str,
+        channel: Optional[discord.TextChannel],
+        message_template: Optional[str],
+        existing_alert: dict
+    ) -> None:
+        """Update an alert record and confirm success."""
+        update_data = {
+            "message_template": message_template
+        }
+        if channel is not None:
+            update_data["channel_id"] = channel.id
+
+        await self.db.db.social_alerts.update_one({"_id": existing_alert["_id"]}, {"$set": update_data})
+
+        updated_channel = channel or interaction.guild.get_channel(existing_alert["channel_id"])
+        template_preview = self._format_alert_preview(message_template)
+        embed = EmbedFactory.success(
+            "Alert Updated",
+            f"Updated alert for **{username}** on **{platform}**.\n\n"
+            f"**Channel:** {updated_channel.mention if updated_channel else 'Unknown'}\n"
+            f"**Custom Message:**\n{template_preview}"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        logger.info("%s updated %s alert for %s", interaction.user, platform, username)
+
     def _build_twitch_embed(self, stream: dict, user: dict) -> discord.Embed:
         """Build a rich Twitch live embed."""
         stream_url = f"https://twitch.tv/{user['login']}"
@@ -106,16 +265,17 @@ class SocialAlerts(commands.Cog):
         embed.set_footer(text=footer_text)
         return embed
 
-    async def _get_twitch_access_token(self) -> Optional[str]:
+    async def _get_twitch_access_token(self) -> tuple[Optional[str], Optional[str]]:
         """Get or refresh the Twitch app access token."""
         if self._twitch_access_token and self._twitch_token_expires_at:
             if discord.utils.utcnow() < self._twitch_token_expires_at:
-                return self._twitch_access_token
+                return self._twitch_access_token, None
 
         client_id, client_secret = self._get_twitch_credentials()
         if not client_id or not client_secret:
-            logger.warning("Twitch alerts are configured but TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET are missing")
-            return None
+            message = "TWITCH_CLIENT_ID or TWITCH_CLIENT_SECRET is missing."
+            logger.warning("Twitch alerts are configured but %s", message)
+            return None, message
 
         session = await self.get_session()
         payload = {
@@ -125,27 +285,27 @@ class SocialAlerts(commands.Cog):
         }
 
         try:
-            async with session.post("https://id.twitch.tv/oauth2/token", params=payload) as response:
+            async with session.post("https://id.twitch.tv/oauth2/token", data=payload) as response:
                 if response.status != 200:
                     body = await response.text()
                     logger.error("Failed to get Twitch access token: %s %s", response.status, body)
-                    return None
+                    return None, f"Twitch token request failed with HTTP {response.status}."
                 data = await response.json()
         except aiohttp.ClientError as error:
             logger.error("Failed to contact Twitch for access token: %s", error, exc_info=True)
-            return None
+            return None, "Could not contact Twitch while requesting an access token."
 
         self._twitch_access_token = data["access_token"]
         expires_in = max(int(data.get("expires_in", 0)) - 60, 60)
         self._twitch_token_expires_at = discord.utils.utcnow() + timedelta(seconds=expires_in)
-        return self._twitch_access_token
+        return self._twitch_access_token, None
 
-    async def _fetch_twitch_user(self, username: str) -> Optional[dict]:
+    async def _fetch_twitch_user(self, username: str) -> tuple[Optional[dict], Optional[str]]:
         """Fetch Twitch user metadata."""
-        token = await self._get_twitch_access_token()
+        token, token_error = await self._get_twitch_access_token()
         client_id, _ = self._get_twitch_credentials()
         if not token or not client_id:
-            return None
+            return None, token_error or "Twitch credentials are unavailable."
 
         session = await self.get_session()
         headers = {
@@ -162,21 +322,23 @@ class SocialAlerts(commands.Cog):
                 if response.status != 200:
                     body = await response.text()
                     logger.error("Failed to fetch Twitch user %s: %s %s", username, response.status, body)
-                    return None
+                    return None, f"Twitch user lookup failed with HTTP {response.status}."
                 data = await response.json()
         except aiohttp.ClientError as error:
             logger.error("Error fetching Twitch user %s: %s", username, error, exc_info=True)
-            return None
+            return None, "Could not contact Twitch while looking up the channel."
 
         users = data.get("data", [])
-        return users[0] if users else None
+        if not users:
+            return None, f"No Twitch channel found for `{username}`."
+        return users[0], None
 
-    async def _fetch_twitch_stream(self, user_id: str) -> Optional[dict]:
+    async def _fetch_twitch_stream(self, user_id: str) -> tuple[Optional[dict], Optional[str]]:
         """Fetch current live Twitch stream for a user ID."""
-        token = await self._get_twitch_access_token()
+        token, token_error = await self._get_twitch_access_token()
         client_id, _ = self._get_twitch_credentials()
         if not token or not client_id:
-            return None
+            return None, token_error or "Twitch credentials are unavailable."
 
         session = await self.get_session()
         headers = {
@@ -193,14 +355,14 @@ class SocialAlerts(commands.Cog):
                 if response.status != 200:
                     body = await response.text()
                     logger.error("Failed to fetch Twitch stream for %s: %s %s", user_id, response.status, body)
-                    return None
+                    return None, f"Twitch stream lookup failed with HTTP {response.status}."
                 data = await response.json()
         except aiohttp.ClientError as error:
             logger.error("Error fetching Twitch stream for %s: %s", user_id, error, exc_info=True)
-            return None
+            return None, "Could not contact Twitch while checking live status."
 
         streams = data.get("data", [])
-        return streams[0] if streams else None
+        return (streams[0] if streams else None), None
 
     async def _send_twitch_alert(
         self,
@@ -267,23 +429,33 @@ class SocialAlerts(commands.Cog):
     async def check_twitch(self, alert: dict):
         """Check Twitch for live streams."""
         username = alert["username"]
-        user = await self._fetch_twitch_user(username)
+        user, user_error = await self._fetch_twitch_user(username)
         if not user:
+            await self._save_alert_check_state(alert["_id"], status="user_lookup_failed", error=user_error)
             return
 
-        stream = await self._fetch_twitch_stream(user["id"])
+        stream, stream_error = await self._fetch_twitch_stream(user["id"])
+        if stream_error:
+            await self._save_alert_check_state(alert["_id"], status="stream_lookup_failed", error=stream_error)
+            return
+
         if not stream:
+            await self._save_alert_check_state(alert["_id"], status="offline", error=None, stream_id=None)
             if alert.get("last_content_id") is not None:
                 await self.db.db.social_alerts.update_one(
                     {"_id": alert["_id"]},
-                    {"$set": {"last_content_id": None, "last_check": discord.utils.utcnow().timestamp()}}
+                    {"$set": {"last_content_id": None}}
                 )
             return
 
         if stream["id"] == alert.get("last_content_id"):
-            await self.db.db.social_alerts.update_one(
-                {"_id": alert["_id"]},
-                {"$set": {"last_check": discord.utils.utcnow().timestamp()}}
+            await self._save_alert_check_state(
+                alert["_id"],
+                status="already_announced",
+                error=None,
+                stream_id=stream["id"],
+                stream_title=stream.get("title"),
+                stream_started_at=stream.get("started_at")
             )
             return
 
@@ -295,21 +467,21 @@ class SocialAlerts(commands.Cog):
         channel = guild.get_channel(alert["channel_id"])
         if not isinstance(channel, discord.TextChannel):
             logger.warning("Channel %s not found for Twitch alert %s", alert["channel_id"], username)
+            await self._save_alert_check_state(alert["_id"], status="channel_missing", error="Alert channel not found.")
             return
 
         sent = await self._send_twitch_alert(alert, channel, stream, user)
         if sent:
-            await self.db.db.social_alerts.update_one(
-                {"_id": alert["_id"]},
-                {
-                    "$set": {
-                        "last_content_id": stream["id"],
-                        "last_check": discord.utils.utcnow().timestamp(),
-                        "last_stream_title": stream.get("title"),
-                        "last_stream_started_at": stream.get("started_at")
-                    }
-                }
+            await self._save_alert_check_state(
+                alert["_id"],
+                status="sent",
+                error=None,
+                stream_id=stream["id"],
+                stream_title=stream.get("title"),
+                stream_started_at=stream.get("started_at")
             )
+        else:
+            await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
 
     async def check_youtube(self, alert: dict):
         """Check YouTube for new videos."""
@@ -323,8 +495,7 @@ class SocialAlerts(commands.Cog):
     @app_commands.describe(
         platform="Platform (twitch/youtube/twitter)",
         username="Username or channel ID",
-        channel="Channel to send alerts to",
-        message_template="Optional custom message. Use {display_name}, {url}, {title}, {username}, {platform}, {viewers}, {everyone}, {here}"
+        channel="Channel to send alerts to"
     )
     @is_admin()
     async def add_alert(
@@ -332,10 +503,9 @@ class SocialAlerts(commands.Cog):
         interaction: discord.Interaction,
         platform: str,
         username: str,
-        channel: discord.TextChannel,
-        message_template: Optional[str] = None
+        channel: discord.TextChannel
     ):
-        """Add social media alert (ADMIN ONLY)"""
+        """Open the social alert setup wizard."""
         platform = platform.lower()
         if platform not in SUPPORTED_PLATFORMS:
             await interaction.response.send_message(
@@ -357,42 +527,14 @@ class SocialAlerts(commands.Cog):
             )
             return
 
-        alert_data = {
-            "guild_id": interaction.guild.id,
-            "channel_id": channel.id,
-            "platform": platform,
-            "username": username.lower(),
-            "message_template": message_template,
-            "last_check": None,
-            "last_content_id": None
-        }
-
-        await self.db.db.social_alerts.insert_one(alert_data)
-
-        platform_emoji = {
-            "twitch": "🟣",
-            "youtube": "🔴",
-            "twitter": "🐦"
-        }
-        template_preview = message_template or DEFAULT_ALERT_TEMPLATE
-
-        embed = EmbedFactory.success(
-            "Alert Added",
-            f"{platform_emoji.get(platform, '📢')} **{platform.title()}** alert added!\n\n"
-            f"**Username:** {username}\n"
-            f"**Channel:** {channel.mention}\n"
-            f"**Custom Message:**\n{template_preview}\n\n"
-            f"You'll be notified when {username} {'goes live' if platform == 'twitch' else 'posts new content'}!"
-        )
-        await interaction.response.send_message(embed=embed)
-        logger.info("%s added %s alert for %s", interaction.user, platform, username)
+        modal = SocialAlertTemplateModal(self, platform, username, channel, mode="create")
+        await interaction.response.send_modal(modal)
 
     @app_commands.command(name="alert-edit", description="Edit an existing social media alert (Admin)")
     @app_commands.describe(
         platform="Platform (twitch/youtube/twitter)",
         username="Username or channel ID",
-        channel="Optional new alert channel",
-        message_template="Optional new custom message. Use {display_name}, {url}, {title}, {username}, {platform}, {viewers}, {everyone}, {here}"
+        channel="Optional new alert channel"
     )
     @is_admin()
     async def edit_alert(
@@ -400,10 +542,9 @@ class SocialAlerts(commands.Cog):
         interaction: discord.Interaction,
         platform: str,
         username: str,
-        channel: Optional[discord.TextChannel] = None,
-        message_template: Optional[str] = None
+        channel: Optional[discord.TextChannel] = None
     ):
-        """Edit an existing social media alert."""
+        """Open the social alert edit wizard."""
         platform = platform.lower()
         if platform not in SUPPORTED_PLATFORMS:
             await interaction.response.send_message(
@@ -424,31 +565,15 @@ class SocialAlerts(commands.Cog):
             )
             return
 
-        if channel is None and message_template is None:
-            await interaction.response.send_message(
-                embed=EmbedFactory.error("Nothing To Update", "Provide a new channel, a new message template, or both."),
-                ephemeral=True
-            )
-            return
-
-        update_data = {}
-        if channel is not None:
-            update_data["channel_id"] = channel.id
-        if message_template is not None:
-            update_data["message_template"] = message_template
-
-        await self.db.db.social_alerts.update_one({"_id": alert["_id"]}, {"$set": update_data})
-
-        updated_channel = channel or interaction.guild.get_channel(alert["channel_id"])
-        updated_template = message_template if message_template is not None else alert.get("message_template") or DEFAULT_ALERT_TEMPLATE
-        embed = EmbedFactory.success(
-            "Alert Updated",
-            f"Updated alert for **{username}** on **{platform}**.\n\n"
-            f"**Channel:** {updated_channel.mention if updated_channel else 'Unknown'}\n"
-            f"**Custom Message:**\n{updated_template}"
+        modal = SocialAlertTemplateModal(
+            self,
+            platform,
+            username,
+            channel,
+            mode="edit",
+            existing_alert=alert
         )
-        await interaction.response.send_message(embed=embed)
-        logger.info("%s updated %s alert for %s", interaction.user, platform, username)
+        await interaction.response.send_modal(modal)
 
     @app_commands.command(name="alert-remove", description="Remove social media alert (Admin)")
     @app_commands.describe(
@@ -580,23 +705,27 @@ class SocialAlerts(commands.Cog):
             return
 
         if platform == "twitch":
-            user = await self._fetch_twitch_user(username.lower())
-            if user:
-                stream = await self._fetch_twitch_stream(user["id"])
-            else:
-                stream = None
-
+            user, user_error = await self._fetch_twitch_user(username.lower())
             if not user:
-                user = {
-                    "login": username.lower(),
-                    "display_name": username,
-                    "profile_image_url": None
-                }
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("Twitch Lookup Failed", user_error or "I couldn't resolve that Twitch channel."),
+                    ephemeral=True
+                )
+                return
+
+            stream, stream_error = await self._fetch_twitch_stream(user["id"])
+            if stream_error:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("Twitch Check Failed", stream_error),
+                    ephemeral=True
+                )
+                return
+
             if not stream:
                 stream = {
-                    "title": "Test Stream Title",
-                    "viewer_count": 73,
-                    "game_name": "Just Chatting",
+                    "title": "Offline Preview",
+                    "viewer_count": 0,
+                    "game_name": "Offline",
                     "thumbnail_url": "https://static-cdn.jtvnw.net/ttv-static/404_preview-1280x720.jpg",
                     "started_at": discord.utils.utcnow().isoformat()
                 }
@@ -609,11 +738,82 @@ class SocialAlerts(commands.Cog):
                 )
                 return
 
+            description = f"Twitch test notification sent to {channel.mention}."
+            if stream.get("title") == "Offline Preview":
+                description += "\n\nThe channel is currently offline, so this used a preview embed with the real profile data."
+
             await interaction.response.send_message(
-                embed=EmbedFactory.success("Test Sent", f"Twitch test notification sent to {channel.mention}"),
+                embed=EmbedFactory.success("Test Sent", description),
                 ephemeral=True
             )
             return
+
+    @app_commands.command(name="alert-debug", description="Diagnose a social media alert (Admin)")
+    @app_commands.describe(
+        platform="Platform (twitch/youtube/twitter)",
+        username="Username to diagnose"
+    )
+    @is_admin()
+    async def debug_alert(
+        self,
+        interaction: discord.Interaction,
+        platform: str,
+        username: str
+    ):
+        """Diagnose why an alert is or is not firing."""
+        platform = platform.lower()
+        if platform not in SUPPORTED_PLATFORMS:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, or twitter"),
+                ephemeral=True
+            )
+            return
+
+        alert = await self.db.db.social_alerts.find_one({
+            "guild_id": interaction.guild.id,
+            "platform": platform,
+            "username": username.lower()
+        })
+        if not alert:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Not Found", f"No alert found for {username} on {platform}"),
+                ephemeral=True
+            )
+            return
+
+        channel = interaction.guild.get_channel(alert["channel_id"])
+        fields = [
+            {"name": "Platform", "value": platform, "inline": True},
+            {"name": "Username", "value": alert["username"], "inline": True},
+            {"name": "Channel", "value": channel.mention if channel else "Missing", "inline": True},
+            {"name": "Last Status", "value": alert.get("last_check_status", "Never checked"), "inline": False},
+            {"name": "Last Error", "value": alert.get("last_check_error") or "None", "inline": False}
+        ]
+
+        if platform == "twitch":
+            client_id, client_secret = self._get_twitch_credentials()
+            fields.append({
+                "name": "Credentials Loaded",
+                "value": "Yes" if client_id and client_secret else "No",
+                "inline": True
+            })
+            user, user_error = await self._fetch_twitch_user(username.lower())
+            if user:
+                stream, stream_error = await self._fetch_twitch_stream(user["id"])
+                state = "Live" if stream else "Offline"
+                if stream_error:
+                    state = f"Error: {stream_error}"
+                fields.append({"name": "Channel Lookup", "value": user.get("display_name", username), "inline": True})
+                fields.append({"name": "Live State", "value": state, "inline": True})
+            else:
+                fields.append({"name": "Channel Lookup", "value": user_error or "Failed", "inline": False})
+
+        embed = EmbedFactory.create(
+            title="📡 Alert Diagnostics",
+            color=EmbedColor.INFO,
+            fields=fields
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
         platform_data = {
             "youtube": {
