@@ -26,6 +26,8 @@ DEFAULT_WELCOME_CARD_SUBTITLE = "Member #{member_count}"
 DEFAULT_WELCOME_CARD_ACCENT = "#F5B8C7"
 DEFAULT_WELCOME_CARD_TEXT = "#F1C1CC"
 DEFAULT_WELCOME_CARD_SIZE = (1200, 520)
+DEFAULT_WELCOME_CARD_TITLE_SIZE = 74
+DEFAULT_WELCOME_CARD_SUBTITLE_SIZE = 44
 
 
 class VerificationSetupModal(discord.ui.Modal, title="Verification Setup"):
@@ -100,7 +102,27 @@ class VerificationButton(discord.ui.View):
     @discord.ui.button(label="Verify", style=discord.ButtonStyle.green, custom_id="verify_button", emoji="✅")
     async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Handle verification button click"""
-        await self.cog.verify_user(interaction)
+        await self.cog.verify_user(interaction, source="verification")
+
+
+class RulesAcceptView(discord.ui.View):
+    """Persistent rules acceptance verification button."""
+
+    def __init__(self, cog: 'Verification', button_label: str = "Accept"):
+        super().__init__(timeout=None)
+        button = discord.ui.Button(
+            label=button_label,
+            style=discord.ButtonStyle.green,
+            custom_id="rules_accept_button",
+            emoji="✅"
+        )
+        button.callback = self.accept_button
+        self.cog = cog
+        self.add_item(button)
+
+    async def accept_button(self, interaction: discord.Interaction):
+        """Handle rules acceptance button click."""
+        await self.cog.verify_user(interaction, source="rules_accept")
 
 
 class CaptchaModal(discord.ui.Modal, title="Verification Captcha"):
@@ -138,6 +160,8 @@ class Verification(commands.Cog):
         self.config = config
         self.module_config = config.get('modules', {}).get('verification', {})
         self.session = None
+        self.bot.add_view(VerificationButton(self))
+        self.bot.add_view(RulesAcceptView(self))
 
     def cog_unload(self):
         """Cleanup resources on cog unload."""
@@ -160,6 +184,49 @@ class Verification(commands.Cog):
             logger.warning("Welcome template missing placeholder %s, falling back to default", missing)
             return fallback.format(**context)
 
+    def _get_rules_button_label(self, guild_config: dict) -> str:
+        """Get the configured rules acceptance button label."""
+        return guild_config.get("rules_button_label") or "Accept"
+
+    def get_rules_accept_view(self, guild_config: dict) -> RulesAcceptView:
+        """Create a rules acceptance view using the saved button label."""
+        return RulesAcceptView(self, button_label=self._get_rules_button_label(guild_config))
+
+    async def save_rules_panel_config(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        panel_message: Optional[str],
+        title: str,
+        description: str,
+        color: str,
+        image_url: Optional[str],
+        footer: Optional[str],
+        button_label: str
+    ) -> dict:
+        """Persist rules-panel verification settings for a guild."""
+        guild_config = await self.db.get_guild(guild_id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(guild_id)
+
+        update_data = {
+            "verification_enabled": True,
+            "rules_panel_enabled": True,
+            "rules_channel": channel_id,
+            "rules_panel_message": panel_message,
+            "rules_title": title,
+            "rules_description": description,
+            "rules_color": color,
+            "rules_image_url": image_url,
+            "rules_footer": footer,
+            "rules_button_label": button_label,
+            "verification_method": "rules_panel"
+        }
+        await self.db.update_guild(guild_id, update_data)
+        guild_config.update(update_data)
+        return guild_config
+
     def _parse_hex_color(self, value: Optional[str], fallback: str) -> tuple[int, int, int]:
         """Parse a hex color into an RGB tuple with fallback support."""
         color_value = (value or fallback).strip().lstrip("#")
@@ -181,6 +248,12 @@ class Verification(commands.Cog):
             return True
         except ValueError:
             return False
+
+    def _clamp_font_size(self, value: Optional[int], fallback: int) -> int:
+        """Clamp configurable font sizes to a safe range."""
+        if value is None:
+            return fallback
+        return max(24, min(140, int(value)))
 
     def _load_font(self, size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         """Load a font available in common Linux/macOS deploy environments."""
@@ -297,8 +370,20 @@ class Verification(commands.Cog):
         )
 
         draw = ImageDraw.Draw(canvas)
-        title_font = self._load_font(56, bold=True)
-        subtitle_font = self._load_font(34, bold=True)
+        title_font = self._load_font(
+            self._clamp_font_size(
+                guild_config.get("welcome_card_title_size"),
+                DEFAULT_WELCOME_CARD_TITLE_SIZE
+            ),
+            bold=True
+        )
+        subtitle_font = self._load_font(
+            self._clamp_font_size(
+                guild_config.get("welcome_card_subtitle_size"),
+                DEFAULT_WELCOME_CARD_SUBTITLE_SIZE
+            ),
+            bold=True
+        )
 
         title_bbox = draw.textbbox((0, 0), title_text, font=title_font)
         subtitle_bbox = draw.textbbox((0, 0), subtitle_text, font=subtitle_font)
@@ -390,6 +475,10 @@ class Verification(commands.Cog):
 
         if guild_config.get("verification_enabled", True) is False:
             logger.info("Verification is disabled for %s; skipping join verification for %s", member.guild, member)
+            return
+
+        if guild_config.get("rules_panel_enabled", False):
+            logger.info("Rules panel verification is enabled for %s; awaiting member acceptance in rules channel", member.guild)
             return
 
         # Send verification to verify channel (if configured) - ONLY VISIBLE TO USER
@@ -508,7 +597,7 @@ class Verification(commands.Cog):
                         )
                     )
 
-    async def verify_user(self, interaction: discord.Interaction):
+    async def verify_user(self, interaction: discord.Interaction, source: str = "verification"):
         """Verify a user and assign role (SILENT - no public announcements)"""
         guild_config = await self.db.get_guild(interaction.guild.id)
         if not guild_config:
@@ -553,16 +642,28 @@ class Verification(commands.Cog):
             await interaction.user.add_roles(verified_role)
 
             # Send private success message
+            success_title = "✅ Verified Successfully!"
+            success_message = (
+                f"Welcome to **{interaction.guild.name}**!\n\n"
+                "You now have access to all channels."
+            )
+            if source == "rules_accept":
+                success_title = "✅ Rules Accepted!"
+                success_message = (
+                    f"You've accepted the rules for **{interaction.guild.name}**.\n\n"
+                    "You now have access to all channels."
+                )
+
             await interaction.response.send_message(
                 embed=EmbedFactory.success(
-                    "✅ Verified Successfully!",
-                    f"Welcome to **{interaction.guild.name}**!\n\nYou now have access to all channels."
+                    success_title,
+                    success_message
                 ),
                 ephemeral=True
             )
 
             # Log silently (no public announcement)
-            logger.info(f"Verified user {interaction.user} in {interaction.guild} (silent)")
+            logger.info(f"Verified user {interaction.user} in {interaction.guild} (silent) via {source}")
 
         except discord.Forbidden:
             await interaction.response.send_message(
@@ -649,9 +750,19 @@ class Verification(commands.Cog):
                 {"name": "Enabled", "value": "Yes" if verification_enabled else "No", "inline": True},
                 {"name": "Method", "value": guild_config.get("verification_method", "dm"), "inline": True},
                 {"name": "Type", "value": guild_config.get("verification_type", "button"), "inline": True},
+                {"name": "Rules Panel", "value": "Enabled" if guild_config.get("rules_panel_enabled", False) else "Disabled", "inline": True},
                 {"name": "Verified Role", "value": verified_role.mention if verified_role else "Missing role", "inline": False},
                 {"name": "Welcome Channel", "value": welcome_channel.mention if welcome_channel else "Not set", "inline": False},
                 {"name": "Verify Channel", "value": verify_channel.mention if verify_channel else "DM only / not set", "inline": False},
+                {
+                    "name": "Rules Channel",
+                    "value": (
+                        interaction.guild.get_channel(guild_config.get("rules_channel")).mention
+                        if guild_config.get("rules_channel") and interaction.guild.get_channel(guild_config.get("rules_channel"))
+                        else "Not set"
+                    ),
+                    "inline": False
+                },
                 {
                     "name": "Welcome Message",
                     "value": (guild_config.get("welcome_message") or "Not set")[:250],
@@ -685,7 +796,9 @@ class Verification(commands.Cog):
         await self.db.update_guild(interaction.guild.id, {
             "verification_enabled": False,
             "verified_role": None,
-            "verify_channel": None
+            "verify_channel": None,
+            "rules_panel_enabled": False,
+            "rules_channel": None
         })
 
         await interaction.response.send_message(
@@ -703,6 +816,8 @@ class Verification(commands.Cog):
         message="Text sent above the welcome image",
         title="Main title on the welcome image",
         subtitle="Subtitle on the welcome image",
+        title_size="Title font size (24-140)",
+        subtitle_size="Subtitle font size (24-140)",
         accent_color="Accent hex color such as #F5B8C7",
         text_color="Text hex color such as #F1C1CC",
         background_image_url="Optional background image URL for the card"
@@ -716,6 +831,8 @@ class Verification(commands.Cog):
         message: Optional[str] = None,
         title: Optional[str] = None,
         subtitle: Optional[str] = None,
+        title_size: Optional[int] = None,
+        subtitle_size: Optional[int] = None,
         accent_color: Optional[str] = None,
         text_color: Optional[str] = None,
         background_image_url: Optional[str] = None
@@ -750,6 +867,16 @@ class Verification(commands.Cog):
             update_data["welcome_card_title"] = title
         if subtitle is not None:
             update_data["welcome_card_subtitle"] = subtitle
+        if title_size is not None:
+            update_data["welcome_card_title_size"] = self._clamp_font_size(
+                title_size,
+                DEFAULT_WELCOME_CARD_TITLE_SIZE
+            )
+        if subtitle_size is not None:
+            update_data["welcome_card_subtitle_size"] = self._clamp_font_size(
+                subtitle_size,
+                DEFAULT_WELCOME_CARD_SUBTITLE_SIZE
+            )
         if accent_color is not None:
             update_data["welcome_card_accent_color"] = accent_color
         if text_color is not None:
@@ -773,6 +900,8 @@ class Verification(commands.Cog):
                 },
                 {"name": "Accent Color", "value": guild_config.get("welcome_card_accent_color", DEFAULT_WELCOME_CARD_ACCENT), "inline": True},
                 {"name": "Text Color", "value": guild_config.get("welcome_card_text_color", DEFAULT_WELCOME_CARD_TEXT), "inline": True},
+                {"name": "Title Size", "value": str(guild_config.get("welcome_card_title_size", DEFAULT_WELCOME_CARD_TITLE_SIZE)), "inline": True},
+                {"name": "Subtitle Size", "value": str(guild_config.get("welcome_card_subtitle_size", DEFAULT_WELCOME_CARD_SUBTITLE_SIZE)), "inline": True},
                 {"name": "Message", "value": (guild_config.get("welcome_card_message") or DEFAULT_WELCOME_CARD_MESSAGE)[:250], "inline": False},
                 {"name": "Title", "value": guild_config.get("welcome_card_title", DEFAULT_WELCOME_CARD_TITLE), "inline": False},
                 {"name": "Subtitle", "value": guild_config.get("welcome_card_subtitle", DEFAULT_WELCOME_CARD_SUBTITLE), "inline": False},

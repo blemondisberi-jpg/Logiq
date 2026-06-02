@@ -3,6 +3,7 @@ Roles Cog for Logiq
 Self-assignable roles with modal-based setup
 """
 
+import colorsys
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -14,6 +15,27 @@ from utils.permissions import is_admin, PermissionChecker
 from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
+MAX_COLOR_PANEL_OPTIONS = 125
+COLOR_MENU_SIZE = 25
+
+
+def build_prefab_color_palette(count: int = MAX_COLOR_PANEL_OPTIONS) -> List[dict]:
+    """Build a wide prefab color palette up to Discord's dropdown limit."""
+    palette = []
+    for index in range(count):
+        hue = index / count
+        saturation = 0.55 + (0.25 * ((index % 5) / 4))
+        value = 0.72 + (0.18 * (((index // 5) % 5) / 4))
+        red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+        rgb = (int(red * 255), int(green * 255), int(blue * 255))
+        hex_value = "#{:02X}{:02X}{:02X}".format(*rgb)
+        palette.append({
+            "name": f"Color {index + 1:03d}",
+            "label": f"Color {index + 1:03d}",
+            "hex": hex_value,
+            "rgb": rgb
+        })
+    return palette
 
 
 class RoleMenuSetupModal(discord.ui.Modal, title="Create Role Menu"):
@@ -315,6 +337,91 @@ class MultiRoleView(discord.ui.View):
         self.add_item(MultiRoleSelect(role_data))
 
 
+class ColorRoleSelect(discord.ui.Select):
+    """Dropdown for switching between generated colour roles."""
+
+    def __init__(self, role_data: List[dict], all_role_ids: List[int], menu_index: int):
+        options = [
+            discord.SelectOption(
+                label=role_info["label"],
+                description=role_info["hex"],
+                value=str(role_info["role"].id)
+            )
+            for role_info in role_data[:COLOR_MENU_SIZE]
+        ]
+
+        super().__init__(
+            placeholder=f"Choose a colour ({menu_index + 1}/5)",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"color_role_select_{menu_index}"
+        )
+        self.all_role_ids = all_role_ids
+
+    async def callback(self, interaction: discord.Interaction):
+        """Switch the user's generated colour role."""
+        try:
+            selected_role_id = int(self.values[0])
+            selected_role = interaction.guild.get_role(selected_role_id)
+            if not selected_role:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("Error", "That colour role no longer exists."),
+                    ephemeral=True
+                )
+                return
+
+            current_color_roles = []
+            for role_id in self.all_role_ids:
+                role = interaction.guild.get_role(role_id)
+                if role and role in interaction.user.roles:
+                    current_color_roles.append(role)
+
+            if len(current_color_roles) == 1 and current_color_roles[0].id == selected_role_id:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.info("Already Selected", f"You're already using **{selected_role.name}**."),
+                    ephemeral=True
+                )
+                return
+
+            roles_to_remove = [role for role in current_color_roles if role.id != selected_role_id]
+            if roles_to_remove:
+                await interaction.user.remove_roles(*roles_to_remove, reason="Color role panel switch")
+
+            if selected_role not in interaction.user.roles:
+                await interaction.user.add_roles(selected_role, reason="Color role panel selection")
+
+            removed_text = ", ".join(role.name for role in roles_to_remove) if roles_to_remove else "None"
+            embed = EmbedFactory.success(
+                "Colour Updated",
+                f"**Added:** {selected_role.name}\n**Removed:** {removed_text}"
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Error", "I don't have permission to manage your colour roles."),
+                ephemeral=True
+            )
+        except Exception as error:
+            logger.error("Error in colour role selection: %s", error, exc_info=True)
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Error", f"Failed to update your colour role: {error}"),
+                ephemeral=True
+            )
+
+
+class ColorRolePanelView(discord.ui.View):
+    """Multi-dropdown panel for a large prefabricated colour palette."""
+
+    def __init__(self, role_data: List[dict]):
+        super().__init__(timeout=None)
+        all_role_ids = [role_info["role"].id for role_info in role_data]
+        for menu_index, start in enumerate(range(0, len(role_data), COLOR_MENU_SIZE)):
+            chunk = role_data[start:start + COLOR_MENU_SIZE]
+            if chunk:
+                self.add_item(ColorRoleSelect(chunk, all_role_ids, menu_index))
+
+
 class Roles(commands.Cog):
     """Role management cog"""
 
@@ -347,6 +454,37 @@ class Roles(commands.Cog):
         if actor.top_role <= role:
             return False, "That role is higher than or equal to your highest role."
         return True, None
+
+    async def _build_or_fetch_color_roles(
+        self,
+        guild: discord.Guild,
+        *,
+        role_prefix: str
+    ) -> List[dict]:
+        """Create or reuse a prefabricated palette of colour roles."""
+        palette = build_prefab_color_palette()
+        role_data = []
+
+        for entry in palette:
+            role_name = f"{role_prefix} {entry['label']} {entry['hex']}"
+            existing_role = discord.utils.get(guild.roles, name=role_name)
+            role = existing_role
+
+            if role is None:
+                role = await guild.create_role(
+                    name=role_name,
+                    colour=discord.Colour.from_rgb(*entry["rgb"]),
+                    mentionable=False,
+                    reason="Prefabricated colour role panel setup"
+                )
+            role_data.append({
+                "role": role,
+                "label": entry["label"],
+                "hex": entry["hex"],
+                "rgb": entry["rgb"]
+            })
+
+        return role_data
 
     async def _mass_role_update(
         self,
@@ -679,6 +817,90 @@ class Roles(commands.Cog):
             mode="remove",
             skip_bots=skip_bots,
             confirm=confirm
+        )
+
+    @app_commands.command(name="create-color-panel", description="Create a prefabricated multi-dropdown colour role panel (Admin)")
+    @app_commands.describe(
+        channel="Channel to send the colour panel to",
+        title="Panel title",
+        description="Panel description",
+        role_prefix="Prefix used when creating colour roles"
+    )
+    @is_admin()
+    async def create_color_panel(
+        self,
+        interaction: discord.Interaction,
+        channel: Optional[discord.TextChannel] = None,
+        title: str = "Choose Your Colour",
+        description: str = "Pick one colour role from the dropdowns below. You can switch colours any time.",
+        role_prefix: str = "Color"
+    ):
+        """Create a prefabricated colour role panel up to Discord's hard dropdown limit."""
+        target_channel = channel or interaction.channel
+        bot_member = self._get_bot_member(interaction.guild)
+        if bot_member is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Error", "I couldn't resolve my bot member in this server."),
+                ephemeral=True
+            )
+            return
+
+        if not bot_member.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Missing Permissions", "I need the **Manage Roles** permission to create colour roles."),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            role_data = await self._build_or_fetch_color_roles(
+                interaction.guild,
+                role_prefix=role_prefix.strip() or "Color"
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Error", "I don't have permission to create roles in this server."),
+                ephemeral=True
+            )
+            return
+        except discord.HTTPException as error:
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Error", f"Discord rejected the colour role setup: {error}"),
+                ephemeral=True
+            )
+            return
+
+        embed = EmbedFactory.create(
+            title=title,
+            description=(
+                f"{description}\n\n"
+                f"**Palette Size:** {len(role_data)} colours across {len(role_data) // COLOR_MENU_SIZE} dropdowns\n"
+                f"**Role Prefix:** {role_prefix.strip() or 'Color'}\n\n"
+                "Each member can hold one generated colour role at a time."
+            ),
+            color=EmbedColor.PREMIUM
+        )
+        embed.set_footer(
+            text="If another higher coloured role overrides these, move the generated colour roles higher in your role list."
+        )
+
+        view = ColorRolePanelView(role_data)
+        await target_channel.send(embed=embed, view=view)
+
+        await interaction.followup.send(
+            embed=EmbedFactory.success(
+                "Colour Panel Created",
+                f"Created or reused **{len(role_data)}** colour roles and posted the panel in {target_channel.mention}."
+            ),
+            ephemeral=True
+        )
+        logger.info(
+            "%s created a prefabricated colour panel with %s roles in %s",
+            interaction.user,
+            len(role_data),
+            interaction.guild
         )
 
 
