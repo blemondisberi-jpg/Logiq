@@ -4,6 +4,7 @@ Monitor Twitch, YouTube, Twitter/X for new content
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 from datetime import datetime, timedelta
@@ -131,6 +132,23 @@ class SocialAlerts(commands.Cog):
         """Format the saved template for confirmations."""
         return message_template or DEFAULT_ALERT_TEMPLATE
 
+    def _get_twitch_preview_url(self, stream: dict) -> str:
+        """Build a Twitch preview URL with cache busting so Discord refreshes each stream image."""
+        preview_url = stream.get("thumbnail_url", "")
+        if not preview_url:
+            return ""
+
+        preview_url = preview_url.replace("{width}", "1280").replace("{height}", "720")
+        cache_key_parts = [
+            str(stream.get("id") or ""),
+            str(stream.get("started_at") or ""),
+            str(stream.get("title") or ""),
+            str(stream.get("viewer_count") or 0)
+        ]
+        cache_key = hashlib.md5("|".join(cache_key_parts).encode("utf-8")).hexdigest()[:12]
+        separator = "&" if "?" in preview_url else "?"
+        return f"{preview_url}{separator}cb={cache_key}"
+
     async def _save_alert_check_state(
         self,
         alert_id,
@@ -235,9 +253,7 @@ class SocialAlerts(commands.Cog):
     def _build_twitch_embed(self, stream: dict, user: dict) -> discord.Embed:
         """Build a rich Twitch live embed."""
         stream_url = f"https://twitch.tv/{user['login']}"
-        preview_url = stream.get("thumbnail_url", "")
-        if preview_url:
-            preview_url = preview_url.replace("{width}", "1280").replace("{height}", "720")
+        preview_url = self._get_twitch_preview_url(stream)
 
         embed = EmbedFactory.create(
             title=stream.get("title") or "Live on Twitch",
