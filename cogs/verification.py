@@ -43,6 +43,37 @@ FONT_SEARCH_DIRS = [
     "/Library/Fonts"
 ]
 BUNDLED_FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+WELCOME_CARD_FONT_PRESETS = {
+    "noto_sans": {
+        "label": "Noto Sans",
+        "regular": "NotoSans-Regular.ttf",
+        "bold": "NotoSans-Bold.ttf"
+    },
+    "poppins": {
+        "label": "Poppins",
+        "regular": "Poppins-Regular.ttf",
+        "bold": "Poppins-Bold.ttf"
+    },
+    "playfair": {
+        "label": "Playfair Display",
+        "regular": "PlayfairDisplay-wght.ttf",
+        "bold": "PlayfairDisplay-wght.ttf"
+    },
+    "fredoka": {
+        "label": "Fredoka",
+        "regular": "Fredoka-wdth-wght.ttf",
+        "bold": "Fredoka-wdth-wght.ttf"
+    },
+    "nunito": {
+        "label": "Nunito",
+        "regular": "Nunito-wght.ttf",
+        "bold": "Nunito-wght.ttf"
+    }
+}
+WELCOME_CARD_FONT_CHOICES = [
+    app_commands.Choice(name=font_data["label"], value=font_key)
+    for font_key, font_data in WELCOME_CARD_FONT_PRESETS.items()
+]
 
 logger = logging.getLogger(__name__)
 
@@ -440,30 +471,30 @@ class Verification(commands.Cog):
         self,
         size: int,
         *,
+        font_key: Optional[str] = None,
         bold: bool = False
     ) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, bool]:
         """Load a bundled scalable font first, then fall back to host fonts if needed."""
         candidates = []
+        preset = WELCOME_CARD_FONT_PRESETS[self._get_font_key(font_key)]
         if bold:
             candidates.extend([
-                "NotoSans-Bold.ttf",
+                preset["bold"],
                 "DejaVuSans-Bold.ttf",
                 "LiberationSans-Bold.ttf",
                 "Arial Bold.ttf",
                 "Arial Bold",
                 "ArialBD.ttf",
-                "NotoSans-Bold.ttf",
                 "FreeSansBold.ttf",
                 "Helvetica.ttc"
             ])
         else:
             candidates.extend([
-                "NotoSans-Regular.ttf",
+                preset["regular"],
                 "DejaVuSans.ttf",
                 "LiberationSans-Regular.ttf",
                 "Arial.ttf",
                 "Arial",
-                "NotoSans-Regular.ttf",
                 "FreeSans.ttf",
                 "Helvetica.ttc"
             ])
@@ -547,6 +578,17 @@ class Verification(commands.Cog):
             logger.warning("Welcome card title rendered as numeric-only value %s; falling back to default title.", stripped)
             return self._render_text_template(None, context, DEFAULT_WELCOME_CARD_TITLE)
         return title_text
+
+    def _get_font_key(self, value: Optional[str]) -> str:
+        """Resolve a saved font key to a known preset."""
+        if value in WELCOME_CARD_FONT_PRESETS:
+            return value
+        return "noto_sans"
+
+    def _get_font_label(self, value: Optional[str]) -> str:
+        """Get the user-facing label for a welcome card font preset."""
+        font_key = self._get_font_key(value)
+        return WELCOME_CARD_FONT_PRESETS[font_key]["label"]
 
     def _measure_text(
         self,
@@ -712,8 +754,10 @@ class Verification(commands.Cog):
             guild_config.get("welcome_card_subtitle_size"),
             DEFAULT_WELCOME_CARD_SUBTITLE_SIZE
         )
-        title_font, title_bitmap_fallback = self._load_font(title_size, bold=True)
-        subtitle_font, subtitle_bitmap_fallback = self._load_font(subtitle_size, bold=True)
+        title_font_key = self._get_font_key(guild_config.get("welcome_card_title_font"))
+        subtitle_font_key = self._get_font_key(guild_config.get("welcome_card_subtitle_font"))
+        title_font, title_bitmap_fallback = self._load_font(title_size, font_key=title_font_key, bold=True)
+        subtitle_font, subtitle_bitmap_fallback = self._load_font(subtitle_size, font_key=subtitle_font_key, bold=True)
 
         title_width, _ = self._measure_text(
             draw,
@@ -1219,12 +1263,15 @@ class Verification(commands.Cog):
         message="Text sent above the welcome image",
         title="Main title on the welcome image",
         subtitle="Subtitle on the welcome image",
+        title_font="Font family for the main title",
+        subtitle_font="Font family for the subtitle",
         title_size="Title font size (24-140)",
         subtitle_size="Subtitle font size (24-140)",
         accent_color="Accent hex color such as #F5B8C7",
         text_color="Text hex color such as #F1C1CC",
         background_image_url="Optional background image URL for the card"
     )
+    @app_commands.choices(title_font=WELCOME_CARD_FONT_CHOICES, subtitle_font=WELCOME_CARD_FONT_CHOICES)
     @is_admin()
     async def welcome_card_config(
         self,
@@ -1234,6 +1281,8 @@ class Verification(commands.Cog):
         message: Optional[str] = None,
         title: Optional[str] = None,
         subtitle: Optional[str] = None,
+        title_font: Optional[str] = None,
+        subtitle_font: Optional[str] = None,
         title_size: Optional[int] = None,
         subtitle_size: Optional[int] = None,
         accent_color: Optional[str] = None,
@@ -1270,6 +1319,10 @@ class Verification(commands.Cog):
             update_data["welcome_card_title"] = title
         if subtitle is not None:
             update_data["welcome_card_subtitle"] = subtitle
+        if title_font is not None:
+            update_data["welcome_card_title_font"] = self._get_font_key(title_font)
+        if subtitle_font is not None:
+            update_data["welcome_card_subtitle_font"] = self._get_font_key(subtitle_font)
         if title_size is not None:
             update_data["welcome_card_title_size"] = self._clamp_font_size(
                 title_size,
@@ -1303,6 +1356,8 @@ class Verification(commands.Cog):
                 },
                 {"name": "Accent Color", "value": guild_config.get("welcome_card_accent_color", DEFAULT_WELCOME_CARD_ACCENT), "inline": True},
                 {"name": "Text Color", "value": guild_config.get("welcome_card_text_color", DEFAULT_WELCOME_CARD_TEXT), "inline": True},
+                {"name": "Title Font", "value": self._get_font_label(guild_config.get("welcome_card_title_font")), "inline": True},
+                {"name": "Subtitle Font", "value": self._get_font_label(guild_config.get("welcome_card_subtitle_font")), "inline": True},
                 {"name": "Title Size", "value": str(guild_config.get("welcome_card_title_size", DEFAULT_WELCOME_CARD_TITLE_SIZE)), "inline": True},
                 {"name": "Subtitle Size", "value": str(guild_config.get("welcome_card_subtitle_size", DEFAULT_WELCOME_CARD_SUBTITLE_SIZE)), "inline": True},
                 {"name": "Message", "value": (guild_config.get("welcome_card_message") or DEFAULT_WELCOME_CARD_MESSAGE)[:250], "inline": False},
@@ -1316,6 +1371,11 @@ class Verification(commands.Cog):
                 {
                     "name": "Placeholders",
                     "value": "`{user}` `{username}` `{display_name}` `{server}` `{member_count}`",
+                    "inline": False
+                },
+                {
+                    "name": "Font Options",
+                    "value": ", ".join(font["label"] for font in WELCOME_CARD_FONT_PRESETS.values()),
                     "inline": False
                 }
             ]
