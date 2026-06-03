@@ -544,15 +544,27 @@ class Verification(commands.Cog):
         target_size: int,
         bitmap_fallback: bool
     ) -> tuple[int, int]:
-        """Measure text width/height, scaling the default bitmap font when needed."""
+        """Measure text width/height, normalizing rendered height to the requested size."""
         bbox = draw.textbbox((0, 0), text, font=font)
         width = max(1, bbox[2] - bbox[0])
         height = max(1, bbox[3] - bbox[1])
-        if not bitmap_fallback:
-            return width, height
-
-        scale = max(target_size / height, 1)
+        scale = self._get_text_scale(height, target_size, bitmap_fallback)
         return max(1, int(width * scale)), max(1, int(height * scale))
+
+    def _get_text_scale(self, base_height: int, target_size: int, bitmap_fallback: bool) -> float:
+        """Determine how much to scale rendered text toward the requested pixel height."""
+        if base_height <= 0:
+            return 1.0
+
+        scale = target_size / base_height
+        if bitmap_fallback:
+            return max(scale, 1.0)
+
+        # FreeType fonts can still render much smaller than the configured size on some hosts.
+        # Normalize obvious mismatches while avoiding unnecessary resampling for near-matches.
+        if 0.9 <= scale <= 1.1:
+            return 1.0
+        return scale
 
     def _draw_scaled_text(
         self,
@@ -565,23 +577,24 @@ class Verification(commands.Cog):
         target_size: int,
         bitmap_fallback: bool
     ) -> None:
-        """Draw text, scaling the bitmap fallback font so size controls still work."""
+        """Draw text, normalizing it to the requested size when the host font renders unexpectedly."""
         draw = ImageDraw.Draw(image)
-        if not bitmap_fallback:
-            draw.text(position, text, font=font, fill=fill)
-            return
-
         bbox = draw.textbbox((0, 0), text, font=font)
         base_width = max(1, bbox[2] - bbox[0])
         base_height = max(1, bbox[3] - bbox[1])
-        scale = max(target_size / base_height, 1)
+        scale = self._get_text_scale(base_height, target_size, bitmap_fallback)
+        if scale == 1.0:
+            draw.text(position, text, font=font, fill=fill)
+            return
+
         mask_width = max(1, int(base_width * scale))
         mask_height = max(1, int(base_height * scale))
 
         mask = Image.new("L", (base_width + 8, base_height + 8), 0)
         mask_draw = ImageDraw.Draw(mask)
         mask_draw.text((4 - bbox[0], 4 - bbox[1]), text, font=font, fill=255)
-        resized_mask = mask.resize((mask_width, mask_height), Image.Resampling.NEAREST)
+        resample = Image.Resampling.NEAREST if bitmap_fallback else Image.Resampling.LANCZOS
+        resized_mask = mask.resize((mask_width, mask_height), resample)
 
         color_image = Image.new("RGBA", (mask_width, mask_height), fill)
         image.paste(color_image, (int(position[0]), int(position[1])), resized_mask)
