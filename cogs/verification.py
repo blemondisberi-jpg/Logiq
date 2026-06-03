@@ -527,6 +527,14 @@ class Verification(commands.Cog):
             return f"Member {stripped}"
         return subtitle_text
 
+    def _normalize_welcome_title(self, title_text: str, context: dict) -> str:
+        """Prevent broken numeric-only titles from rendering on welcome cards."""
+        stripped = title_text.strip()
+        if stripped.isdigit():
+            logger.warning("Welcome card title rendered as numeric-only value %s; falling back to default title.", stripped)
+            return self._render_text_template(None, context, DEFAULT_WELCOME_CARD_TITLE)
+        return title_text
+
     def _measure_text(
         self,
         draw: ImageDraw.ImageDraw,
@@ -661,6 +669,7 @@ class Verification(commands.Cog):
             context,
             DEFAULT_WELCOME_CARD_TITLE
         )
+        title_text = self._normalize_welcome_title(title_text, context)
         subtitle_text = self._render_text_template(
             guild_config.get("welcome_card_subtitle"),
             context,
