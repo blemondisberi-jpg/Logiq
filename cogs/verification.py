@@ -6,6 +6,7 @@ Handles user verification with multiple methods
 import discord
 from discord import app_commands
 from discord.ext import commands
+from pathlib import Path
 import random
 import string
 from typing import Optional
@@ -30,6 +31,17 @@ DEFAULT_WELCOME_CARD_TITLE_SIZE = 74
 DEFAULT_WELCOME_CARD_SUBTITLE_SIZE = 44
 DEFAULT_VERIFICATION_MODE = "button"
 CAPTCHA_CODE_LENGTH = 6
+FONT_SEARCH_DIRS = [
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/liberation2",
+    "/usr/share/fonts/truetype/noto",
+    "/usr/share/fonts/opentype/noto",
+    "/usr/local/share/fonts",
+    "/System/Library/Fonts/Supplemental",
+    "/System/Library/Fonts",
+    "/Library/Fonts"
+]
 
 logger = logging.getLogger(__name__)
 
@@ -428,24 +440,50 @@ class Verification(commands.Cog):
         candidates = []
         if bold:
             candidates.extend([
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-                "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-                "/Library/Fonts/Arial Bold.ttf"
+                "DejaVuSans-Bold.ttf",
+                "LiberationSans-Bold.ttf",
+                "Arial Bold.ttf",
+                "Arial Bold",
+                "ArialBD.ttf",
+                "NotoSans-Bold.ttf",
+                "FreeSansBold.ttf",
+                "Helvetica.ttc"
             ])
         else:
             candidates.extend([
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-                "/System/Library/Fonts/Supplemental/Arial.ttf",
-                "/Library/Fonts/Arial.ttf"
+                "DejaVuSans.ttf",
+                "LiberationSans-Regular.ttf",
+                "Arial.ttf",
+                "Arial",
+                "NotoSans-Regular.ttf",
+                "FreeSans.ttf",
+                "Helvetica.ttc"
             ])
 
-        for path in candidates:
+        for candidate in candidates:
             try:
-                return ImageFont.truetype(path, size)
+                return ImageFont.truetype(candidate, size)
             except OSError:
                 continue
+
+        for search_dir in FONT_SEARCH_DIRS:
+            directory = Path(search_dir)
+            if not directory.exists():
+                continue
+            for candidate in candidates:
+                font_path = directory / candidate
+                if not font_path.exists():
+                    continue
+                try:
+                    return ImageFont.truetype(str(font_path), size)
+                except OSError:
+                    continue
+
+        logger.warning(
+            "Welcome card font loader could not find a scalable font for size=%s bold=%s; using Pillow default font.",
+            size,
+            bold
+        )
         return ImageFont.load_default()
 
     async def _fetch_url_image(self, url: str) -> Optional[Image.Image]:
