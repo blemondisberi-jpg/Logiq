@@ -435,7 +435,12 @@ class Verification(commands.Cog):
 
         await self.verify_user(interaction, source="rules_accept", guild_id=guild.id)
 
-    def _load_font(self, size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    def _load_font(
+        self,
+        size: int,
+        *,
+        bold: bool = False
+    ) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, bool]:
         """Load a font available in common Linux/macOS deploy environments."""
         candidates = []
         if bold:
@@ -462,9 +467,22 @@ class Verification(commands.Cog):
 
         for candidate in candidates:
             try:
-                return ImageFont.truetype(candidate, size)
+                return ImageFont.truetype(candidate, size), False
             except OSError:
                 continue
+
+        pil_font_dir = Path(ImageFont.__file__).resolve().parent
+        for directory in [pil_font_dir, pil_font_dir / "fonts", pil_font_dir.parent / "fonts"]:
+            if not directory.exists():
+                continue
+            for candidate in candidates:
+                font_path = directory / candidate
+                if not font_path.exists():
+                    continue
+                try:
+                    return ImageFont.truetype(str(font_path), size), False
+                except OSError:
+                    continue
 
         for search_dir in FONT_SEARCH_DIRS:
             directory = Path(search_dir)
@@ -475,16 +493,90 @@ class Verification(commands.Cog):
                 if not font_path.exists():
                     continue
                 try:
-                    return ImageFont.truetype(str(font_path), size)
+                    return ImageFont.truetype(str(font_path), size), False
                 except OSError:
                     continue
+
+            try:
+                for font_path in directory.rglob("*.ttf"):
+                    candidate_name = font_path.name.lower()
+                    if bold and "bold" not in candidate_name:
+                        continue
+                    if not bold and "bold" in candidate_name:
+                        continue
+                    try:
+                        return ImageFont.truetype(str(font_path), size), False
+                    except OSError:
+                        continue
+            except OSError:
+                continue
 
         logger.warning(
             "Welcome card font loader could not find a scalable font for size=%s bold=%s; using Pillow default font.",
             size,
             bold
         )
-        return ImageFont.load_default()
+        return ImageFont.load_default(), True
+
+    def _normalize_welcome_subtitle(self, subtitle_text: str) -> str:
+        """Ensure bare member counts still render as a user-facing position string."""
+        stripped = subtitle_text.strip()
+        if stripped.isdigit():
+            return f"Member #{stripped}"
+        if stripped.startswith("#") and stripped[1:].isdigit():
+            return f"Member {stripped}"
+        return subtitle_text
+
+    def _measure_text(
+        self,
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+        *,
+        target_size: int,
+        bitmap_fallback: bool
+    ) -> tuple[int, int]:
+        """Measure text width/height, scaling the default bitmap font when needed."""
+        bbox = draw.textbbox((0, 0), text, font=font)
+        width = max(1, bbox[2] - bbox[0])
+        height = max(1, bbox[3] - bbox[1])
+        if not bitmap_fallback:
+            return width, height
+
+        scale = max(target_size / height, 1)
+        return max(1, int(width * scale)), max(1, int(height * scale))
+
+    def _draw_scaled_text(
+        self,
+        image: Image.Image,
+        *,
+        position: tuple[float, float],
+        text: str,
+        font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+        fill: tuple[int, int, int] | tuple[int, int, int, int],
+        target_size: int,
+        bitmap_fallback: bool
+    ) -> None:
+        """Draw text, scaling the bitmap fallback font so size controls still work."""
+        draw = ImageDraw.Draw(image)
+        if not bitmap_fallback:
+            draw.text(position, text, font=font, fill=fill)
+            return
+
+        bbox = draw.textbbox((0, 0), text, font=font)
+        base_width = max(1, bbox[2] - bbox[0])
+        base_height = max(1, bbox[3] - bbox[1])
+        scale = max(target_size / base_height, 1)
+        mask_width = max(1, int(base_width * scale))
+        mask_height = max(1, int(base_height * scale))
+
+        mask = Image.new("L", (base_width + 8, base_height + 8), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.text((4 - bbox[0], 4 - bbox[1]), text, font=font, fill=255)
+        resized_mask = mask.resize((mask_width, mask_height), Image.Resampling.NEAREST)
+
+        color_image = Image.new("RGBA", (mask_width, mask_height), fill)
+        image.paste(color_image, (int(position[0]), int(position[1])), resized_mask)
 
     async def _fetch_url_image(self, url: str) -> Optional[Image.Image]:
         """Fetch an image from a remote URL."""
@@ -574,35 +666,74 @@ class Verification(commands.Cog):
             context,
             DEFAULT_WELCOME_CARD_SUBTITLE
         )
+        subtitle_text = self._normalize_welcome_subtitle(subtitle_text)
 
         draw = ImageDraw.Draw(canvas)
-        title_font = self._load_font(
-            self._clamp_font_size(
-                guild_config.get("welcome_card_title_size"),
-                DEFAULT_WELCOME_CARD_TITLE_SIZE
-            ),
-            bold=True
+        title_size = self._clamp_font_size(
+            guild_config.get("welcome_card_title_size"),
+            DEFAULT_WELCOME_CARD_TITLE_SIZE
         )
-        subtitle_font = self._load_font(
-            self._clamp_font_size(
-                guild_config.get("welcome_card_subtitle_size"),
-                DEFAULT_WELCOME_CARD_SUBTITLE_SIZE
-            ),
-            bold=True
+        subtitle_size = self._clamp_font_size(
+            guild_config.get("welcome_card_subtitle_size"),
+            DEFAULT_WELCOME_CARD_SUBTITLE_SIZE
         )
+        title_font, title_bitmap_fallback = self._load_font(title_size, bold=True)
+        subtitle_font, subtitle_bitmap_fallback = self._load_font(subtitle_size, bold=True)
 
-        title_bbox = draw.textbbox((0, 0), title_text, font=title_font)
-        subtitle_bbox = draw.textbbox((0, 0), subtitle_text, font=subtitle_font)
-        title_width = title_bbox[2] - title_bbox[0]
-        subtitle_width = subtitle_bbox[2] - subtitle_bbox[0]
+        title_width, _ = self._measure_text(
+            draw,
+            title_text,
+            title_font,
+            target_size=title_size,
+            bitmap_fallback=title_bitmap_fallback
+        )
+        subtitle_width, _ = self._measure_text(
+            draw,
+            subtitle_text,
+            subtitle_font,
+            target_size=subtitle_size,
+            bitmap_fallback=subtitle_bitmap_fallback
+        )
 
         title_position = ((width - title_width) / 2, 318)
         subtitle_position = ((width - subtitle_width) / 2, 392)
         shadow = (0, 0, 0, 130)
-        draw.text((title_position[0] + 2, title_position[1] + 2), title_text, font=title_font, fill=shadow)
-        draw.text(title_position, title_text, font=title_font, fill=text_color)
-        draw.text((subtitle_position[0] + 2, subtitle_position[1] + 2), subtitle_text, font=subtitle_font, fill=shadow)
-        draw.text(subtitle_position, subtitle_text, font=subtitle_font, fill=text_color)
+        self._draw_scaled_text(
+            canvas,
+            position=(title_position[0] + 2, title_position[1] + 2),
+            text=title_text,
+            font=title_font,
+            fill=shadow,
+            target_size=title_size,
+            bitmap_fallback=title_bitmap_fallback
+        )
+        self._draw_scaled_text(
+            canvas,
+            position=title_position,
+            text=title_text,
+            font=title_font,
+            fill=text_color,
+            target_size=title_size,
+            bitmap_fallback=title_bitmap_fallback
+        )
+        self._draw_scaled_text(
+            canvas,
+            position=(subtitle_position[0] + 2, subtitle_position[1] + 2),
+            text=subtitle_text,
+            font=subtitle_font,
+            fill=shadow,
+            target_size=subtitle_size,
+            bitmap_fallback=subtitle_bitmap_fallback
+        )
+        self._draw_scaled_text(
+            canvas,
+            position=subtitle_position,
+            text=subtitle_text,
+            font=subtitle_font,
+            fill=text_color,
+            target_size=subtitle_size,
+            bitmap_fallback=subtitle_bitmap_fallback
+        )
 
         output = BytesIO()
         canvas.convert("RGB").save(output, format="PNG", quality=95)
