@@ -42,6 +42,7 @@ FONT_SEARCH_DIRS = [
     "/System/Library/Fonts",
     "/Library/Fonts"
 ]
+BUNDLED_FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 
 logger = logging.getLogger(__name__)
 
@@ -441,10 +442,11 @@ class Verification(commands.Cog):
         *,
         bold: bool = False
     ) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, bool]:
-        """Load a font available in common Linux/macOS deploy environments."""
+        """Load a bundled scalable font first, then fall back to host fonts if needed."""
         candidates = []
         if bold:
             candidates.extend([
+                "NotoSans-Bold.ttf",
                 "DejaVuSans-Bold.ttf",
                 "LiberationSans-Bold.ttf",
                 "Arial Bold.ttf",
@@ -456,6 +458,7 @@ class Verification(commands.Cog):
             ])
         else:
             candidates.extend([
+                "NotoSans-Regular.ttf",
                 "DejaVuSans.ttf",
                 "LiberationSans-Regular.ttf",
                 "Arial.ttf",
@@ -464,6 +467,16 @@ class Verification(commands.Cog):
                 "FreeSans.ttf",
                 "Helvetica.ttc"
             ])
+
+        if BUNDLED_FONT_DIR.exists():
+            for candidate in candidates:
+                font_path = BUNDLED_FONT_DIR / candidate
+                if not font_path.exists():
+                    continue
+                try:
+                    return ImageFont.truetype(str(font_path), size), False
+                except OSError:
+                    continue
 
         for candidate in candidates:
             try:
