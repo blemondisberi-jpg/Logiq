@@ -241,9 +241,39 @@ class AIChat(commands.Cog):
                     f"{message.author.mention} Your message was removed for violating community guidelines.",
                     delete_after=10
                 )
+                await self._log_action(
+                    message.guild,
+                    EmbedFactory.create(
+                        title="🚨 AutoMod: Toxicity Filter",
+                        color=EmbedColor.ERROR,
+                        fields=[
+                            {"name": "User", "value": f"{message.author.mention} ({message.author.id})", "inline": False},
+                            {"name": "Channel", "value": message.channel.mention, "inline": True},
+                            {"name": "Action", "value": "Message removed", "inline": True},
+                            {"name": "Content", "value": (message.content[:900] + "...") if len(message.content) > 900 else (message.content or "None"), "inline": False}
+                        ]
+                    )
+                )
                 logger.info(f"Auto-moderated message from {message.author} in {message.guild}")
             except discord.Forbidden:
                 pass
+
+    async def _log_action(self, guild: discord.Guild, embed: discord.Embed):
+        """Log AI auto-moderation events to the configured server log channel"""
+        guild_config = await self.db.get_guild(guild.id)
+        if not guild_config:
+            return
+
+        log_channel_id = guild_config.get('log_channel')
+        if not log_channel_id:
+            return
+
+        log_channel = guild.get_channel(log_channel_id)
+        if log_channel:
+            try:
+                await log_channel.send(embed=embed)
+            except discord.Forbidden:
+                logger.warning(f"Cannot send AI moderation log in {guild}")
 
 
 async def setup(bot: commands.Bot):

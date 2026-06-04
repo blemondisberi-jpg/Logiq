@@ -102,6 +102,28 @@ class DatabaseManager:
         )
         return result.modified_count > 0
 
+    async def get_guild_users_with_birthday(self, guild_id: int, month: int, day: int) -> List[Dict[str, Any]]:
+        """Get users in a guild whose stored birthday matches the given month/day"""
+        cursor = self.db.users.find({
+            "guild_id": guild_id,
+            "birthday_month": month,
+            "birthday_day": day
+        })
+        return await cursor.to_list(length=1000)
+
+    async def get_guild_birthdays(self, guild_id: int) -> List[Dict[str, Any]]:
+        """Get all stored birthdays for a guild"""
+        cursor = self.db.users.find({
+            "guild_id": guild_id,
+            "birthday_month": {"$exists": True, "$ne": None},
+            "birthday_day": {"$exists": True, "$ne": None}
+        }).sort([
+            ("birthday_month", 1),
+            ("birthday_day", 1),
+            ("user_id", 1),
+        ])
+        return await cursor.to_list(length=1000)
+
     # Guild operations
     async def get_guild(self, guild_id: int) -> Optional[Dict[str, Any]]:
         """Get guild configuration"""

@@ -52,6 +52,17 @@ class Moderation(commands.Cog):
                 f"{message.author.mention} Please don't spam mentions!",
                 delete_after=5
             )
+            log_embed = EmbedFactory.create(
+                title="🚨 AutoMod: Mention Spam",
+                color=EmbedColor.WARNING,
+                fields=[
+                    {"name": "User", "value": f"{message.author.mention} ({message.author.id})", "inline": False},
+                    {"name": "Channel", "value": message.channel.mention, "inline": True},
+                    {"name": "Mentions", "value": str(len(message.mentions)), "inline": True},
+                    {"name": "Content", "value": (message.content[:900] + "...") if len(message.content) > 900 else (message.content or "None"), "inline": False}
+                ]
+            )
+            await self._log_action(message.guild, log_embed)
             return
 
     async def _check_spam(self, message: discord.Message):
@@ -80,6 +91,16 @@ class Moderation(commands.Cog):
                     delete_after=10
                 )
                 self.spam_tracker[user_id] = []
+                log_embed = EmbedFactory.create(
+                    title="🚨 AutoMod: Spam Timeout",
+                    color=EmbedColor.ERROR,
+                    fields=[
+                        {"name": "User", "value": f"{message.author.mention} ({message.author.id})", "inline": False},
+                        {"name": "Channel", "value": message.channel.mention, "inline": True},
+                        {"name": "Action", "value": "Timed out for 5 minutes", "inline": True},
+                    ]
+                )
+                await self._log_action(message.guild, log_embed)
                 logger.info(f"Auto-muted {message.author} for spam")
             except discord.Forbidden:
                 pass

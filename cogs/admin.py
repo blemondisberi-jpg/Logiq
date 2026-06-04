@@ -193,6 +193,21 @@ class Admin(commands.Cog):
                 f"Deleted **{len(deleted)}** messages"
             )
             await interaction.response.send_message(embed=embed, ephemeral=True, delete_after=5)
+            guild_config = await self.db.get_guild(interaction.guild.id)
+            if guild_config and guild_config.get('log_channel'):
+                log_channel = interaction.guild.get_channel(guild_config['log_channel'])
+                if log_channel:
+                    await log_channel.send(
+                        embed=EmbedFactory.create(
+                            title="🗑️ Messages Purged",
+                            color=EmbedColor.WARNING,
+                            fields=[
+                                {"name": "Moderator", "value": interaction.user.mention, "inline": True},
+                                {"name": "Channel", "value": interaction.channel.mention, "inline": True},
+                                {"name": "Amount", "value": str(len(deleted)), "inline": True},
+                            ]
+                        )
+                    )
             logger.info(f"{interaction.user} purged {len(deleted)} messages in {interaction.channel}")
         except discord.Forbidden:
             await interaction.response.send_message(
