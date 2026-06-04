@@ -190,6 +190,8 @@ class ExclusiveRoleSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         """Handle exclusive role selection - LOCKED after first selection"""
         try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+
             # Check if user already has any role from THIS MENU ONLY
             user_has_role = False
             existing_role = None
@@ -201,7 +203,7 @@ class ExclusiveRoleSelect(discord.ui.Select):
                     break
 
             if user_has_role:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     embed=EmbedFactory.error(
                         "🔒 Role Already Selected",
                         f"You already have **{existing_role.name}**. You cannot select another role from this menu."
@@ -214,7 +216,7 @@ class ExclusiveRoleSelect(discord.ui.Select):
             selected_role = interaction.guild.get_role(selected_role_id)
 
             if not selected_role:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     embed=EmbedFactory.error("Error", "Role not found"),
                     ephemeral=True
                 )
@@ -228,18 +230,20 @@ class ExclusiveRoleSelect(discord.ui.Select):
                 f"You now have the **{selected_role.name}** role!\n\n"
                 f"**Note:** You cannot select another role from this menu."
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
             logger.info(f"{interaction.user} selected exclusive role {selected_role.name}")
 
         except discord.Forbidden:
-            await interaction.response.send_message(
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
                 embed=EmbedFactory.error("Error", "I don't have permission to manage your roles. Please contact an admin."),
                 ephemeral=True
             )
         except Exception as e:
             logger.error(f"Error in role selection: {e}", exc_info=True)
-            await interaction.response.send_message(
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
                 embed=EmbedFactory.error("Error", f"Failed to assign role: {str(e)}"),
                 ephemeral=True
             )
@@ -270,6 +274,8 @@ class MultiRoleSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         """Handle role selection"""
         try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+
             selected_role_ids = {int(value) for value in self.values}
             current_role_ids = {role.id for role in interaction.user.roles}
 
@@ -306,16 +312,18 @@ class MultiRoleSelect(discord.ui.Select):
                 "✅ Roles Updated!",
                 "\n".join(changes)
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
         except discord.Forbidden:
-            await interaction.response.send_message(
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
                 embed=EmbedFactory.error("Error", "I don't have permission to manage your roles. Please contact an admin."),
                 ephemeral=True
             )
         except Exception as e:
             logger.error(f"Error in multi-role selection: {e}", exc_info=True)
-            await interaction.response.send_message(
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
                 embed=EmbedFactory.error("Error", f"Failed to update roles: {str(e)}"),
                 ephemeral=True
             )
@@ -362,10 +370,12 @@ class ColorRoleSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         """Switch the user's generated colour role."""
         try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+
             selected_role_id = int(self.values[0])
             selected_role = interaction.guild.get_role(selected_role_id)
             if not selected_role:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     embed=EmbedFactory.error("Error", "That colour role no longer exists."),
                     ephemeral=True
                 )
@@ -378,7 +388,7 @@ class ColorRoleSelect(discord.ui.Select):
                     current_color_roles.append(role)
 
             if len(current_color_roles) == 1 and current_color_roles[0].id == selected_role_id:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     embed=EmbedFactory.info("Already Selected", f"You're already using **{selected_role.name}**."),
                     ephemeral=True
                 )
@@ -396,15 +406,17 @@ class ColorRoleSelect(discord.ui.Select):
                 "Colour Updated",
                 f"**Added:** {selected_role.name}\n**Removed:** {removed_text}"
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
         except discord.Forbidden:
-            await interaction.response.send_message(
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
                 embed=EmbedFactory.error("Error", "I don't have permission to manage your colour roles."),
                 ephemeral=True
             )
         except Exception as error:
             logger.error("Error in colour role selection: %s", error, exc_info=True)
-            await interaction.response.send_message(
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
                 embed=EmbedFactory.error("Error", f"Failed to update your colour role: {error}"),
                 ephemeral=True
             )

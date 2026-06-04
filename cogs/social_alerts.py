@@ -36,6 +36,7 @@ TWITCH_EVENTSUB_RECREATE_STATUSES = {
     "user_removed",
     "version_removed",
 }
+TWITCH_EVENTSUB_POLL_SUPPRESSION_SECONDS = 90
 
 
 class SocialAlertTemplateModal(discord.ui.Modal):
@@ -289,6 +290,25 @@ class SocialAlerts(commands.Cog):
 
         if update_data:
             await self.db.db.social_alerts.update_one({"_id": alert_id}, {"$set": update_data})
+
+    def _should_suppress_poll_alert(self, alert: dict) -> bool:
+        """Skip poll-driven sends briefly after a successful EventSub-driven delivery."""
+        if alert.get("last_delivery_source") != "eventsub":
+            return False
+
+        received_at = alert.get("last_eventsub_received_at")
+        if not received_at:
+            return False
+
+        try:
+            elapsed = discord.utils.utcnow().timestamp() - float(received_at)
+        except (TypeError, ValueError):
+            return False
+
+        if elapsed < 0 or elapsed > TWITCH_EVENTSUB_POLL_SUPPRESSION_SECONDS:
+            return False
+
+        return alert.get("last_check_status") in {"sent", "already_announced"}
 
     async def _create_alert_record(
         self,
@@ -1309,6 +1329,17 @@ class SocialAlerts(commands.Cog):
                     )
                 continue
 
+            if self._should_suppress_poll_alert(alert):
+                await self._save_alert_check_state(
+                    alert["_id"],
+                    status="already_announced",
+                    error=None,
+                    stream_id=stream["id"],
+                    stream_title=stream.get("title"),
+                    stream_started_at=stream.get("started_at")
+                )
+                continue
+
             if stream["id"] == alert.get("last_content_id"):
                 await self._save_alert_check_state(
                     alert["_id"],
@@ -1410,6 +1441,17 @@ class SocialAlerts(commands.Cog):
                     {"_id": alert["_id"]},
                     {"$set": {"last_content_id": None}}
                 )
+            return
+
+        if self._should_suppress_poll_alert(alert):
+            await self._save_alert_check_state(
+                alert["_id"],
+                status="already_announced",
+                error=None,
+                stream_id=stream["id"],
+                stream_title=stream.get("title"),
+                stream_started_at=stream.get("started_at")
+            )
             return
 
         if stream["id"] == alert.get("last_content_id"):
