@@ -4,6 +4,7 @@ Self-assignable roles with modal-based setup
 """
 
 import colorsys
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -17,6 +18,7 @@ from database.db_manager import DatabaseManager
 logger = logging.getLogger(__name__)
 MAX_COLOR_PANEL_OPTIONS = 125
 COLOR_MENU_SIZE = 25
+ROLE_MENU_COLLECTION = "role_menus"
 
 
 def build_prefab_color_palette(count: int = MAX_COLOR_PANEL_OPTIONS) -> List[dict]:
@@ -150,7 +152,22 @@ class RoleMenuSetupModal(discord.ui.Modal, title="Create Role Menu"):
             view = MultiRoleView(role_list)
 
         # Send to channel
-        await self.channel.send(embed=embed, view=view)
+        message = await self.channel.send(embed=embed, view=view)
+        await self.cog._store_role_menu(
+            guild_id=interaction.guild.id,
+            channel_id=self.channel.id,
+            message_id=message.id,
+            menu_type="exclusive" if is_exclusive else "multi",
+            category_name=self.title_input.value if is_exclusive else None,
+            roles=[
+                {
+                    "role_id": role_info["role"].id,
+                    "emoji": role_info["emoji"],
+                    "label": role_info["label"]
+                }
+                for role_info in role_list
+            ]
+        )
 
         # Respond to interaction
         await interaction.response.send_message(
@@ -448,8 +465,231 @@ class Roles(commands.Cog):
     async def _register_persistent_views(self):
         """Register persistent views for role menus"""
         await self.bot.wait_until_ready()
-        # Views are automatically re-registered when messages are loaded
-        logger.info("Role menu persistent views ready")
+        stored_menus = await self.db.db[ROLE_MENU_COLLECTION].find({}).to_list(length=1000)
+        restored = 0
+
+        for menu in stored_menus:
+            guild = self.bot.get_guild(menu.get("guild_id"))
+            if guild is None:
+                continue
+
+            menu_type = menu.get("menu_type")
+            if menu_type in {"exclusive", "multi"}:
+                role_data = []
+                for item in menu.get("roles", []):
+                    role = guild.get_role(item.get("role_id"))
+                    if role is None:
+                        continue
+                    role_data.append({
+                        "role": role,
+                        "emoji": item.get("emoji") or "🎭",
+                        "label": item.get("label") or role.name
+                    })
+
+                if not role_data:
+                    continue
+
+                if menu_type == "exclusive":
+                    view = ExclusiveRoleView(role_data, menu.get("category_name") or "role-menu")
+                else:
+                    view = MultiRoleView(role_data)
+            elif menu_type == "color":
+                role_data = []
+                for item in menu.get("roles", []):
+                    role = guild.get_role(item.get("role_id"))
+                    if role is None:
+                        continue
+                    role_data.append({
+                        "role": role,
+                        "label": item.get("label") or role.name,
+                        "hex": item.get("hex") or "#000000",
+                        "rgb": tuple(item.get("rgb", (0, 0, 0)))
+                    })
+
+                if not role_data:
+                    continue
+
+                view = ColorRolePanelView(role_data)
+            else:
+                continue
+
+            try:
+                self.bot.add_view(view, message_id=int(menu["message_id"]))
+                restored += 1
+            except Exception as error:
+                logger.warning("Failed to restore persistent role menu %s: %s", menu.get("message_id"), error)
+
+        logger.info("Role menu persistent views ready (%s restored)", restored)
+
+    async def _store_role_menu(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        menu_type: str,
+        roles: List[dict],
+        category_name: Optional[str] = None
+    ) -> None:
+        """Persist a role menu so its view survives bot restarts."""
+        payload = {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "menu_type": menu_type,
+            "roles": roles
+        }
+        if category_name is not None:
+            payload["category_name"] = category_name
+
+        await self.db.db[ROLE_MENU_COLLECTION].update_one(
+            {"message_id": message_id},
+            {"$set": payload},
+            upsert=True
+        )
+
+    def _extract_role_ids_from_embed(self, embed: discord.Embed) -> List[int]:
+        """Extract mentioned role IDs from a role-menu embed."""
+        role_ids = []
+        texts = []
+        if embed.description:
+            texts.append(embed.description)
+        for field in embed.fields:
+            texts.append(field.value or "")
+
+        for text in texts:
+            for role_id in re.findall(r"<@&(\d+)>", text):
+                role_ids.append(int(role_id))
+
+        deduped = []
+        seen = set()
+        for role_id in role_ids:
+            if role_id not in seen:
+                deduped.append(role_id)
+                seen.add(role_id)
+        return deduped
+
+    def _build_color_role_regex(self, role_prefix: str) -> re.Pattern:
+        """Return the generated colour-role naming pattern for a prefix."""
+        return re.compile(rf"^{re.escape(role_prefix)} Color \d{{3}} #[0-9A-F]{{6}}$")
+
+    async def _repair_role_menu_message(
+        self,
+        guild: discord.Guild,
+        message: discord.Message
+    ) -> tuple[bool, str]:
+        """Re-bind an existing role menu or colour panel message."""
+        if not message.components:
+            return False, "That message has no interactive components to repair."
+        if not message.embeds:
+            return False, "That message has no embed content I can use to rebuild the menu."
+
+        custom_ids = []
+        for row in message.components:
+            for child in getattr(row, "children", []):
+                custom_id = getattr(child, "custom_id", None)
+                if custom_id:
+                    custom_ids.append(custom_id)
+
+        if not custom_ids:
+            return False, "I couldn't find any dropdown custom IDs on that message."
+
+        embed = message.embeds[0]
+
+        if any(custom_id.startswith("color_role_select_") for custom_id in custom_ids):
+            description = embed.description or ""
+            prefix_match = re.search(r"\*\*Role Prefix:\*\*\s*([^\n]+)", description)
+            role_prefix = prefix_match.group(1).strip() if prefix_match else "Color"
+            pattern = self._build_color_role_regex(role_prefix)
+            role_data = []
+            for role in sorted(guild.roles, key=lambda item: item.name):
+                if pattern.match(role.name):
+                    hex_match = re.search(r"(#[0-9A-F]{6})$", role.name)
+                    role_data.append({
+                        "role": role,
+                        "label": role.name.split(" ")[1] + " " + role.name.split(" ")[2] if len(role.name.split(" ")) >= 3 else role.name,
+                        "hex": hex_match.group(1) if hex_match else "#{:02X}{:02X}{:02X}".format(
+                            role.colour.r, role.colour.g, role.colour.b
+                        ),
+                        "rgb": (role.colour.r, role.colour.g, role.colour.b)
+                    })
+
+            if not role_data:
+                return False, f"I couldn't find any generated colour roles for prefix `{role_prefix}`."
+
+            self.bot.add_view(ColorRolePanelView(role_data), message_id=message.id)
+            await self._store_role_menu(
+                guild_id=guild.id,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                menu_type="color",
+                roles=[
+                    {
+                        "role_id": role_info["role"].id,
+                        "label": role_info["label"],
+                        "hex": role_info["hex"],
+                        "rgb": list(role_info["rgb"])
+                    }
+                    for role_info in role_data
+                ]
+            )
+            return True, f"Repaired colour panel for prefix `{role_prefix}` with {len(role_data)} roles."
+
+        role_ids = self._extract_role_ids_from_embed(embed)
+        role_data = []
+        for role_id in role_ids:
+            role = guild.get_role(role_id)
+            if role is None:
+                continue
+            role_data.append({
+                "role": role,
+                "emoji": "🎭",
+                "label": role.name
+            })
+
+        if not role_data:
+            return False, "I couldn't recover any roles from that menu message."
+
+        exclusive_id = next((custom_id for custom_id in custom_ids if custom_id.startswith("exclusive_role_")), None)
+        if exclusive_id:
+            category_name = exclusive_id.removeprefix("exclusive_role_") or "role-menu"
+            self.bot.add_view(ExclusiveRoleView(role_data, category_name), message_id=message.id)
+            await self._store_role_menu(
+                guild_id=guild.id,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                menu_type="exclusive",
+                category_name=category_name,
+                roles=[
+                    {
+                        "role_id": role_info["role"].id,
+                        "emoji": role_info["emoji"],
+                        "label": role_info["label"]
+                    }
+                    for role_info in role_data
+                ]
+            )
+            return True, f"Repaired exclusive role menu with {len(role_data)} roles."
+
+        if "multi_role_select" in custom_ids:
+            self.bot.add_view(MultiRoleView(role_data), message_id=message.id)
+            await self._store_role_menu(
+                guild_id=guild.id,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                menu_type="multi",
+                roles=[
+                    {
+                        "role_id": role_info["role"].id,
+                        "emoji": role_info["emoji"],
+                        "label": role_info["label"]
+                    }
+                    for role_info in role_data
+                ]
+            )
+            return True, f"Repaired multi-select role menu with {len(role_data)} roles."
+
+        return False, "I couldn't determine what kind of role menu that message is."
 
     def _get_bot_member(self, guild: discord.Guild) -> Optional[discord.Member]:
         """Get the bot's guild member object."""
@@ -727,7 +967,22 @@ class Roles(commands.Cog):
             view = MultiRoleView(role_list)
         
         # Send to channel
-        await target_channel.send(embed=embed, view=view)
+        message = await target_channel.send(embed=embed, view=view)
+        await self._store_role_menu(
+            guild_id=interaction.guild.id,
+            channel_id=target_channel.id,
+            message_id=message.id,
+            menu_type="exclusive" if is_exclusive else "multi",
+            category_name=title if is_exclusive else None,
+            roles=[
+                {
+                    "role_id": role_info["role"].id,
+                    "emoji": role_info["emoji"],
+                    "label": role_info["label"]
+                }
+                for role_info in role_list
+            ]
+        )
         
         await interaction.response.send_message(
             embed=EmbedFactory.success(
@@ -899,7 +1154,22 @@ class Roles(commands.Cog):
         )
 
         view = ColorRolePanelView(role_data)
-        await target_channel.send(embed=embed, view=view)
+        message = await target_channel.send(embed=embed, view=view)
+        await self._store_role_menu(
+            guild_id=interaction.guild.id,
+            channel_id=target_channel.id,
+            message_id=message.id,
+            menu_type="color",
+            roles=[
+                {
+                    "role_id": role_info["role"].id,
+                    "label": role_info["label"],
+                    "hex": role_info["hex"],
+                    "rgb": list(role_info["rgb"])
+                }
+                for role_info in role_data
+            ]
+        )
 
         await interaction.followup.send(
             embed=EmbedFactory.success(
@@ -914,6 +1184,65 @@ class Roles(commands.Cog):
             len(role_data),
             interaction.guild
         )
+
+    @app_commands.command(name="repair-role-menu", description="Repair an existing role menu or colour panel message (Admin)")
+    @app_commands.describe(
+        channel="Channel containing the broken menu message",
+        message_id="Message ID of the broken dropdown message"
+    )
+    @is_admin()
+    async def repair_role_menu(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        message_id: str
+    ):
+        """Re-bind a previously posted role menu or colour panel after restart/deploy issues."""
+        try:
+            parsed_message_id = int(message_id.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Invalid Message ID", "Please provide a numeric Discord message ID."),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=False)
+
+        try:
+            message = await channel.fetch_message(parsed_message_id)
+        except discord.NotFound:
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Not Found", "I couldn't find a message with that ID in the selected channel."),
+                ephemeral=True
+            )
+            return
+        except discord.Forbidden:
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Missing Permissions", "I can't read message history in that channel."),
+                ephemeral=True
+            )
+            return
+        except discord.HTTPException as error:
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Fetch Failed", f"Discord rejected the message lookup: {error}"),
+                ephemeral=True
+            )
+            return
+
+        repaired, detail = await self._repair_role_menu_message(interaction.guild, message)
+        if not repaired:
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Repair Failed", detail),
+                ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(
+            embed=EmbedFactory.success("Role Menu Repaired", detail),
+            ephemeral=True
+        )
+        logger.info("%s repaired role menu message %s in %s", interaction.user, message.id, interaction.guild)
 
 
 async def setup(bot: commands.Bot):
