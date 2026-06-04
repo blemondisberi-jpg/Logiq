@@ -590,6 +590,23 @@ class Verification(commands.Cog):
         font_key = self._get_font_key(value)
         return WELCOME_CARD_FONT_PRESETS[font_key]["label"]
 
+    async def _get_member_position(self, member: discord.Member) -> int:
+        """Calculate a reliable current member position for welcome cards."""
+        try:
+            member_ids = set()
+            async for guild_member in member.guild.fetch_members(limit=None):
+                member_ids.add(guild_member.id)
+
+            if member.id not in member_ids:
+                member_ids.add(member.id)
+
+            if member_ids:
+                return len(member_ids)
+        except Exception as error:
+            logger.warning("Failed to fetch guild members for welcome card position: %s", error)
+
+        return member.guild.member_count or len(member.guild.members) or 1
+
     def _measure_text(
         self,
         draw: ImageDraw.ImageDraw,
@@ -724,7 +741,7 @@ class Verification(commands.Cog):
         avatar_y = 96
         canvas.paste(border, (avatar_x, avatar_y), border)
 
-        member_count = member.guild.member_count or len(member.guild.members)
+        member_count = await self._get_member_position(member)
         context = {
             "user": member.mention,
             "username": member.name,
@@ -853,7 +870,7 @@ class Verification(commands.Cog):
             "username": member.name,
             "display_name": member.display_name,
             "server": member.guild.name,
-            "member_count": member.guild.member_count or len(member.guild.members)
+            "member_count": await self._get_member_position(member)
         }
 
         # Send welcome message in welcome channel (PUBLIC - everyone can see)
@@ -1403,7 +1420,7 @@ class Verification(commands.Cog):
             "username": interaction.user.name,
             "display_name": interaction.user.display_name,
             "server": interaction.guild.name,
-            "member_count": interaction.guild.member_count or len(interaction.guild.members)
+            "member_count": await self._get_member_position(interaction.user)
         }
         welcome_content = self._render_text_template(
             guild_config.get("welcome_card_message"),

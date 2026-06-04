@@ -185,6 +185,8 @@ class ExclusiveRoleSelect(discord.ui.Select):
     """Dropdown for exclusive role selection (pick only one)"""
 
     def __init__(self, role_data: List[dict], category_name: str):
+        self.role_data = role_data
+        self.category_name = category_name
         options = [
             discord.SelectOption(
                 label=r['label'],
@@ -247,6 +249,7 @@ class ExclusiveRoleSelect(discord.ui.Select):
                 f"You now have the **{selected_role.name}** role!\n\n"
                 f"**Note:** You cannot select another role from this menu."
             )
+            await interaction.message.edit(view=ExclusiveRoleView(self.role_data, self.category_name))
             await interaction.followup.send(embed=embed, ephemeral=True)
 
             logger.info(f"{interaction.user} selected exclusive role {selected_role.name}")
@@ -270,6 +273,7 @@ class MultiRoleSelect(discord.ui.Select):
     """Dropdown menu for multiple role selection"""
 
     def __init__(self, role_data: List[dict]):
+        self.role_data = role_data
         options = [
             discord.SelectOption(
                 label=r['label'],
@@ -329,6 +333,7 @@ class MultiRoleSelect(discord.ui.Select):
                 "✅ Roles Updated!",
                 "\n".join(changes)
             )
+            await interaction.message.edit(view=MultiRoleView(self.role_data))
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except discord.Forbidden:
@@ -366,6 +371,7 @@ class ColorRoleSelect(discord.ui.Select):
     """Dropdown for switching between generated colour roles."""
 
     def __init__(self, role_data: List[dict], all_role_ids: List[int], menu_index: int):
+        self.role_data = role_data
         options = [
             discord.SelectOption(
                 label=role_info["label"],
@@ -423,6 +429,8 @@ class ColorRoleSelect(discord.ui.Select):
                 "Colour Updated",
                 f"**Added:** {selected_role.name}\n**Removed:** {removed_text}"
             )
+            full_role_data = getattr(self.view, "role_data", self.role_data)
+            await interaction.message.edit(view=ColorRolePanelView(full_role_data))
             await interaction.followup.send(embed=embed, ephemeral=True)
         except discord.Forbidden:
             sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
@@ -444,6 +452,7 @@ class ColorRolePanelView(discord.ui.View):
 
     def __init__(self, role_data: List[dict]):
         super().__init__(timeout=None)
+        self.role_data = role_data
         all_role_ids = [role_info["role"].id for role_info in role_data]
         for menu_index, start in enumerate(range(0, len(role_data), COLOR_MENU_SIZE)):
             chunk = role_data[start:start + COLOR_MENU_SIZE]
