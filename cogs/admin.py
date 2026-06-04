@@ -30,6 +30,39 @@ class Admin(commands.Cog):
     @is_admin()
     async def reload(self, interaction: discord.Interaction, cog: str):
         """Reload a cog"""
+        cog = cog.strip()
+        if cog.lower() == "all":
+            await interaction.response.defer(ephemeral=True)
+
+            reloaded = []
+            failed = []
+            loaded_cogs = sorted(
+                extension_name
+                for extension_name in self.bot.extensions
+                if extension_name.startswith("cogs.")
+            )
+
+            for extension_name in loaded_cogs:
+                try:
+                    await self.bot.reload_extension(extension_name)
+                    reloaded.append(extension_name.replace("cogs.", "", 1))
+                except Exception as error:
+                    failed.append((extension_name.replace("cogs.", "", 1), str(error)))
+                    logger.error("Error reloading cog %s during full reload: %s", extension_name, error, exc_info=True)
+
+            description = f"Reloaded **{len(reloaded)}** cog(s)."
+            if reloaded:
+                description += "\n\n**Reloaded:** " + ", ".join(reloaded)
+            if failed:
+                failed_text = "\n".join(f"• **{name}**: {message}" for name, message in failed[:10])
+                description += f"\n\n**Failed ({len(failed)}):**\n{failed_text}"
+
+            embed_factory = EmbedFactory.success if not failed else EmbedFactory.warning
+            embed = embed_factory("Full Reload Complete", description)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info("%s reloaded all cogs (%s successful, %s failed)", interaction.user, len(reloaded), len(failed))
+            return
+
         try:
             await self.bot.reload_extension(f"cogs.{cog}")
             embed = EmbedFactory.success(

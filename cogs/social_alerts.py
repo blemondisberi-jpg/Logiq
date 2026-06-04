@@ -703,6 +703,26 @@ class SocialAlerts(commands.Cog):
                 if not ok:
                     logger.warning("Failed to delete orphan EventSub subscription %s: %s", subscription["id"], error)
 
+    async def _get_eventsub_status_for_broadcaster(self, broadcaster_id: str) -> tuple[dict[str, str], Optional[str]]:
+        """Return EventSub subscription status for the given broadcaster."""
+        subscriptions, error = await self._list_twitch_eventsub_subscriptions()
+        if error:
+            return {}, error
+
+        callback_url = self._get_twitch_eventsub_callback_url()
+        status_map: dict[str, str] = {}
+        for subscription in subscriptions:
+            if subscription.get("type") not in TWITCH_EVENTSUB_TYPES:
+                continue
+            if subscription.get("condition", {}).get("broadcaster_user_id") != broadcaster_id:
+                continue
+            transport = subscription.get("transport", {})
+            if transport.get("method") != "webhook" or transport.get("callback") != callback_url:
+                continue
+            status_map[subscription["type"]] = subscription.get("status", "unknown")
+
+        return status_map, None
+
     async def handle_twitch_eventsub_request(self, message_type: str, payload: dict) -> Optional[str]:
         """Process Twitch EventSub webhook payloads."""
         if message_type == "webhook_callback_verification":
@@ -952,7 +972,7 @@ class SocialAlerts(commands.Cog):
             alerts = await cursor.to_list(length=1000)
 
             twitch_alerts = [alert for alert in alerts if alert.get("platform") == "twitch"]
-            if twitch_alerts and not self._eventsub_is_configured():
+            if twitch_alerts:
                 await self._check_twitch_alerts_batch(twitch_alerts)
 
             for alert in alerts:
@@ -1406,6 +1426,18 @@ class SocialAlerts(commands.Cog):
                     state = f"Error: {stream_error}"
                 fields.append({"name": "Channel Lookup", "value": user.get("display_name", username), "inline": True})
                 fields.append({"name": "Live State", "value": state, "inline": True})
+                if self._eventsub_is_configured():
+                    status_map, sub_error = await self._get_eventsub_status_for_broadcaster(user["id"])
+                    if sub_error:
+                        fields.append({"name": "EventSub Status", "value": sub_error, "inline": False})
+                    else:
+                        online_status = status_map.get("stream.online", "missing")
+                        offline_status = status_map.get("stream.offline", "missing")
+                        fields.append({
+                            "name": "EventSub Subscriptions",
+                            "value": f"stream.online: `{online_status}`\nstream.offline: `{offline_status}`",
+                            "inline": False
+                        })
             else:
                 fields.append({"name": "Channel Lookup", "value": user_error or "Failed", "inline": False})
 
