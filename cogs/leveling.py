@@ -30,6 +30,22 @@ class Leveling(commands.Cog):
         self.module_config = config.get('modules', {}).get('leveling', {})
         self.xp_cooldown = {}
 
+    def _get_level_up_channel(
+        self,
+        guild: discord.Guild,
+        guild_config: Optional[dict]
+    ) -> Optional[discord.TextChannel]:
+        """Resolve the configured level-up announcement channel for a guild."""
+        if not guild_config:
+            return None
+
+        channel_id = guild_config.get("level_up_channel")
+        if not channel_id:
+            return None
+
+        channel = guild.get_channel(channel_id)
+        return channel if isinstance(channel, discord.TextChannel) else None
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Award XP for messages"""
@@ -48,6 +64,8 @@ class Leveling(commands.Cog):
                 return
 
         self.xp_cooldown[user_key] = current_time
+
+        guild_config = await self.db.get_guild(message.guild.id)
 
         # Get or create user
         user_data = await self.db.get_user(message.author.id, message.guild.id)
@@ -71,10 +89,46 @@ class Leveling(commands.Cog):
 
             # Send level up message
             embed = EmbedFactory.level_up(message.author, new_level, new_xp)
-            await message.channel.send(embed=embed)
+            target_channel = self._get_level_up_channel(message.guild, guild_config) or message.channel
+
+            try:
+                await target_channel.send(embed=embed)
+            except discord.Forbidden:
+                logger.warning("Missing permissions to send level-up message in %s for guild %s", target_channel, message.guild)
+            except discord.HTTPException as error:
+                logger.error("Failed to send level-up message in %s for guild %s: %s", target_channel, message.guild, error, exc_info=True)
             logger.info(f"{message.author} leveled up to {new_level} in {message.guild}")
         else:
             await self.db.update_user(message.author.id, message.guild.id, {'xp': new_xp})
+
+    @app_commands.command(name="setlevelchannel", description="Set the channel used for level-up notifications (Admin)")
+    @app_commands.describe(channel="Channel for level-up announcements. Leave empty to disable the dedicated channel.")
+    @is_admin()
+    async def set_level_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: Optional[discord.TextChannel] = None
+    ):
+        """Set or clear the dedicated level-up announcement channel."""
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(interaction.guild.id)
+
+        await self.db.update_guild(interaction.guild.id, {
+            "level_up_channel": channel.id if channel else None
+        })
+
+        if channel is None:
+            embed = EmbedFactory.success(
+                "Level-Up Channel Cleared",
+                "Level-up notifications will now appear in the same channel where the message was sent."
+            )
+        else:
+            embed = EmbedFactory.success(
+                "Level-Up Channel Set",
+                f"Level-up notifications will now be sent to {channel.mention}."
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # NOTE: /rank and /leaderboard commands have been moved to games.py as PUBLIC commands
 
