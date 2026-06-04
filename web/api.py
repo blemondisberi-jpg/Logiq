@@ -5,6 +5,7 @@ REST API endpoints for bot statistics and management
 
 from datetime import datetime, timedelta, timezone
 import json
+import re
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,24 @@ import os
 
 logger = logging.getLogger(__name__)
 TWITCH_EVENTSUB_PATH = "/webhooks/twitch/eventsub"
+
+
+def parse_twitch_rfc3339(timestamp: str) -> datetime | None:
+    """Parse Twitch RFC3339 timestamps, including nanosecond precision."""
+    if not timestamp:
+        return None
+
+    match = re.match(r"^(?P<prefix>.+\.\d{1,})(?P<suffix>Z|[+-]\d{2}:\d{2})$", timestamp)
+    if match:
+        prefix = match.group("prefix")
+        suffix = match.group("suffix")
+        head, frac = prefix.split(".", 1)
+        timestamp = f"{head}.{frac[:6]}{suffix}"
+
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def create_app(bot) -> FastAPI:
@@ -212,17 +231,22 @@ def create_app(bot) -> FastAPI:
         message_type = request.headers.get("Twitch-Eventsub-Message-Type", "")
 
         if not message_id or not timestamp or not signature or not message_type:
+            logger.warning("Rejected Twitch EventSub request due to missing headers")
             raise HTTPException(status_code=400, detail="Missing Twitch EventSub headers")
 
-        try:
-            sent_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        except ValueError:
+        sent_at = parse_twitch_rfc3339(timestamp)
+        if sent_at is None:
+            logger.warning("Rejected Twitch EventSub request due to invalid timestamp: %s", timestamp)
             raise HTTPException(status_code=400, detail="Invalid Twitch EventSub timestamp")
 
-        if abs((datetime.now(timezone.utc) - sent_at).total_seconds()) > 600:
-            raise HTTPException(status_code=400, detail="Twitch EventSub message is too old")
+        # Keep replay protection, but don't let strict freshness checks break the one-time webhook verification.
+        if message_type != "webhook_callback_verification":
+            if abs((datetime.now(timezone.utc) - sent_at).total_seconds()) > 600:
+                logger.warning("Rejected Twitch EventSub request because timestamp was too old: %s", timestamp)
+                raise HTTPException(status_code=400, detail="Twitch EventSub message is too old")
 
         if not social_alerts.verify_eventsub_signature(body, message_id, timestamp, signature):
+            logger.warning("Rejected Twitch EventSub request because signature verification failed")
             raise HTTPException(status_code=403, detail="Invalid Twitch EventSub signature")
 
         if message_id in social_alerts._recent_eventsub_messages:
@@ -237,6 +261,7 @@ def create_app(bot) -> FastAPI:
         payload = json.loads(body.decode("utf-8"))
         challenge = await social_alerts.handle_twitch_eventsub_request(message_type, payload)
         if challenge is not None:
+            logger.info("Responding to Twitch EventSub challenge request")
             return PlainTextResponse(content=challenge)
 
         return Response(status_code=204)
