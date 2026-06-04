@@ -110,6 +110,7 @@ class SocialAlerts(commands.Cog):
         self._twitch_token_expires_at: Optional[datetime] = None
         self._twitch_user_cache: dict[str, dict] = {}
         self._recent_eventsub_messages: dict[str, datetime] = {}
+        self._eventsub_live_tasks: dict[str, asyncio.Task] = {}
         self.check_alerts_task.start()
         self.reconcile_eventsub_task.start()
 
@@ -117,6 +118,9 @@ class SocialAlerts(commands.Cog):
         """Cleanup on cog unload"""
         self.check_alerts_task.cancel()
         self.reconcile_eventsub_task.cancel()
+        for task in self._eventsub_live_tasks.values():
+            task.cancel()
+        self._eventsub_live_tasks.clear()
         if self.session:
             asyncio.create_task(self.session.close())
 
@@ -901,6 +905,9 @@ class SocialAlerts(commands.Cog):
             return None
 
         if subscription_type == "stream.offline":
+            existing_task = self._eventsub_live_tasks.pop(broadcaster_id, None)
+            if existing_task and not existing_task.done():
+                existing_task.cancel()
             for alert in alerts:
                 await self._save_alert_check_state(alert["_id"], status="offline", error=None, stream_id=None)
                 if alert.get("last_content_id") is not None:
@@ -910,60 +917,121 @@ class SocialAlerts(commands.Cog):
                     )
             return None
 
-        user_login = event.get("broadcaster_user_login")
-        if user_login:
-            user = None
-            user_error = None
-            cached = self._twitch_user_cache.get(user_login.lower())
-            if cached and cached.get("expires_at") and discord.utils.utcnow() < cached["expires_at"]:
-                user = cached["user"]
-            else:
-                user, user_error = await self._fetch_twitch_user(user_login.lower())
-            if not user:
-                logger.warning("EventSub received live event but Twitch user lookup failed for %s: %s", user_login, user_error)
-                return None
-        else:
-            streamless_user = {"id": broadcaster_id, "login": "", "display_name": event.get("broadcaster_user_name") or "Unknown"}
-            user = streamless_user
-
-        stream, stream_error = await self._fetch_twitch_stream(broadcaster_id)
-        if stream_error or not stream:
-            logger.warning("EventSub received live event but stream fetch failed for broadcaster %s: %s", broadcaster_id, stream_error or "No stream returned")
+        existing_task = self._eventsub_live_tasks.get(broadcaster_id)
+        if existing_task and not existing_task.done():
+            logger.info("Ignoring duplicate Twitch EventSub live notification for broadcaster %s while a live task is already running", broadcaster_id)
             return None
 
-        for alert in alerts:
-            guild = self.bot.get_guild(alert["guild_id"])
-            if not guild:
-                continue
-            channel = guild.get_channel(alert["channel_id"])
-            if not isinstance(channel, discord.TextChannel):
-                continue
-
-            if stream["id"] == alert.get("last_content_id"):
-                await self._save_alert_check_state(
-                    alert["_id"],
-                    status="already_announced",
-                    error=None,
-                    stream_id=stream["id"],
-                    stream_title=stream.get("title"),
-                    stream_started_at=stream.get("started_at")
-                )
-                continue
-
-            sent = await self._send_twitch_alert(alert, channel, stream, user)
-            if sent:
-                await self._save_alert_check_state(
-                    alert["_id"],
-                    status="sent",
-                    error=None,
-                    stream_id=stream["id"],
-                    stream_title=stream.get("title"),
-                    stream_started_at=stream.get("started_at")
-                )
-            else:
-                await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
-
+        task = asyncio.create_task(
+            self._process_twitch_eventsub_live_notification(
+                broadcaster_id=broadcaster_id,
+                alerts=alerts,
+                event=event
+            )
+        )
+        self._eventsub_live_tasks[broadcaster_id] = task
         return None
+
+    async def _process_twitch_eventsub_live_notification(
+        self,
+        *,
+        broadcaster_id: str,
+        alerts: list[dict],
+        event: dict
+    ) -> None:
+        """Resolve a Twitch stream shortly after EventSub says it went live."""
+        try:
+            user_login = (event.get("broadcaster_user_login") or "").lower()
+            if user_login:
+                cached = self._twitch_user_cache.get(user_login)
+                if cached and cached.get("expires_at") and discord.utils.utcnow() < cached["expires_at"]:
+                    user = cached["user"]
+                else:
+                    user, user_error = await self._fetch_twitch_user(user_login)
+                    if not user:
+                        logger.warning(
+                            "EventSub received live event but Twitch user lookup failed for %s: %s",
+                            user_login,
+                            user_error
+                        )
+                        return
+            else:
+                user = {
+                    "id": broadcaster_id,
+                    "login": "",
+                    "display_name": event.get("broadcaster_user_name") or "Unknown"
+                }
+
+            stream = None
+            stream_error = None
+            for attempt in range(8):
+                stream, stream_error = await self._fetch_twitch_stream(broadcaster_id)
+                if stream:
+                    if attempt:
+                        logger.info(
+                            "Resolved Twitch stream for broadcaster %s via EventSub after %s retries",
+                            broadcaster_id,
+                            attempt
+                        )
+                    break
+                if stream_error:
+                    break
+                await asyncio.sleep(1)
+
+            if stream_error or not stream:
+                logger.warning(
+                    "EventSub received live event but stream fetch failed for broadcaster %s after retries: %s",
+                    broadcaster_id,
+                    stream_error or "No stream returned"
+                )
+                return
+
+            for alert in alerts:
+                guild = self.bot.get_guild(alert["guild_id"])
+                if not guild:
+                    continue
+                channel = guild.get_channel(alert["channel_id"])
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+
+                if stream["id"] == alert.get("last_content_id"):
+                    await self._save_alert_check_state(
+                        alert["_id"],
+                        status="already_announced",
+                        error=None,
+                        stream_id=stream["id"],
+                        stream_title=stream.get("title"),
+                        stream_started_at=stream.get("started_at")
+                    )
+                    continue
+
+                sent = await self._send_twitch_alert(alert, channel, stream, user)
+                if sent:
+                    await self._save_alert_check_state(
+                        alert["_id"],
+                        status="sent",
+                        error=None,
+                        stream_id=stream["id"],
+                        stream_title=stream.get("title"),
+                        stream_started_at=stream.get("started_at")
+                    )
+                else:
+                    await self._save_alert_check_state(
+                        alert["_id"],
+                        status="send_failed",
+                        error="Discord rejected the alert message."
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Unhandled error while processing Twitch EventSub live notification for broadcaster %s",
+                broadcaster_id
+            )
+        finally:
+            current_task = self._eventsub_live_tasks.get(broadcaster_id)
+            if current_task is asyncio.current_task():
+                self._eventsub_live_tasks.pop(broadcaster_id, None)
 
     async def _send_twitch_alert(
         self,
