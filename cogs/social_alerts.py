@@ -209,6 +209,16 @@ class SocialAlerts(commands.Cog):
         separator = "&" if "?" in preview_url else "?"
         return f"{preview_url}{separator}cb={cache_key}"
 
+    def _format_debug_timestamp(self, value: Optional[float]) -> str:
+        """Format a stored UNIX timestamp for diagnostics."""
+        if not value:
+            return "None"
+        try:
+            dt = datetime.fromtimestamp(float(value))
+        except (TypeError, ValueError, OSError):
+            return "Invalid"
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
     async def _save_alert_check_state(
         self,
         alert_id,
@@ -253,6 +263,32 @@ class SocialAlerts(commands.Cog):
             update_data["eventsub_offline_status"] = offline_status
 
         await self.db.db.social_alerts.update_one({"_id": alert_id}, {"$set": update_data})
+
+    async def _save_alert_delivery_metadata(
+        self,
+        alert_id,
+        *,
+        source: Optional[str] = None,
+        eventsub_received_at: Optional[float] = None,
+        discord_sent_at: Optional[float] = None,
+        eventsub_notification_type: Optional[str] = None,
+        eventsub_enriched_at: Optional[float] = None
+    ) -> None:
+        """Persist alert delivery source/timing metadata for diagnostics."""
+        update_data = {}
+        if source is not None:
+            update_data["last_delivery_source"] = source
+        if eventsub_received_at is not None:
+            update_data["last_eventsub_received_at"] = eventsub_received_at
+        if discord_sent_at is not None:
+            update_data["last_discord_sent_at"] = discord_sent_at
+        if eventsub_notification_type is not None:
+            update_data["last_eventsub_notification_type"] = eventsub_notification_type
+        if eventsub_enriched_at is not None:
+            update_data["last_eventsub_enriched_at"] = eventsub_enriched_at
+
+        if update_data:
+            await self.db.db.social_alerts.update_one({"_id": alert_id}, {"$set": update_data})
 
     async def _create_alert_record(
         self,
@@ -941,6 +977,12 @@ class SocialAlerts(commands.Cog):
             if existing_task and not existing_task.done():
                 existing_task.cancel()
             for alert in alerts:
+                await self._save_alert_delivery_metadata(
+                    alert["_id"],
+                    source="eventsub",
+                    eventsub_received_at=discord.utils.utcnow().timestamp(),
+                    eventsub_notification_type="stream.offline"
+                )
                 await self._save_alert_check_state(alert["_id"], status="offline", error=None, stream_id=None)
                 if alert.get("last_content_id") is not None:
                     await self.db.db.social_alerts.update_one(
@@ -973,6 +1015,15 @@ class SocialAlerts(commands.Cog):
     ) -> None:
         """Resolve a Twitch stream shortly after EventSub says it went live."""
         try:
+            event_received_at = discord.utils.utcnow().timestamp()
+            for alert in alerts:
+                await self._save_alert_delivery_metadata(
+                    alert["_id"],
+                    source="eventsub",
+                    eventsub_received_at=event_received_at,
+                    eventsub_notification_type="stream.online"
+                )
+
             user_login = (event.get("broadcaster_user_login") or "").lower()
             if user_login:
                 cached = self._twitch_user_cache.get(user_login)
@@ -1024,6 +1075,11 @@ class SocialAlerts(commands.Cog):
                     continue
 
                 provisional_messages.append((alert, message))
+                await self._save_alert_delivery_metadata(
+                    alert["_id"],
+                    source="eventsub",
+                    discord_sent_at=discord.utils.utcnow().timestamp()
+                )
                 await self._save_alert_check_state(
                     alert["_id"],
                     status="sent",
@@ -1078,6 +1134,11 @@ class SocialAlerts(commands.Cog):
 
                 try:
                     await message.edit(content=rich_content, embed=rich_embed)
+                    await self._save_alert_delivery_metadata(
+                        alert["_id"],
+                        source="eventsub",
+                        eventsub_enriched_at=discord.utils.utcnow().timestamp()
+                    )
                 except discord.Forbidden:
                     logger.warning("Missing permissions to edit provisional Twitch alert message %s", message.id)
                 except discord.HTTPException as error:
@@ -1272,6 +1333,11 @@ class SocialAlerts(commands.Cog):
 
             sent = await self._send_twitch_alert(alert, channel, stream, user)
             if sent:
+                await self._save_alert_delivery_metadata(
+                    alert["_id"],
+                    source="poll",
+                    discord_sent_at=discord.utils.utcnow().timestamp()
+                )
                 await self._save_alert_check_state(
                     alert["_id"],
                     status="sent",
@@ -1370,6 +1436,11 @@ class SocialAlerts(commands.Cog):
 
         sent = await self._send_twitch_alert(alert, channel, stream, user)
         if sent:
+            await self._save_alert_delivery_metadata(
+                alert["_id"],
+                source="poll",
+                discord_sent_at=discord.utils.utcnow().timestamp()
+            )
             await self._save_alert_check_state(
                 alert["_id"],
                 status="sent",
@@ -1761,6 +1832,30 @@ class SocialAlerts(commands.Cog):
                     fields.append({
                         "name": "EventSub Last Error",
                         "value": alert.get("eventsub_last_error"),
+                        "inline": False
+                    })
+                fields.append({
+                    "name": "Last Delivery Source",
+                    "value": alert.get("last_delivery_source", "Unknown"),
+                    "inline": True
+                })
+                fields.append({
+                    "name": "EventSub Received",
+                    "value": self._format_debug_timestamp(alert.get("last_eventsub_received_at")),
+                    "inline": True
+                })
+                fields.append({
+                    "name": "Discord Sent",
+                    "value": self._format_debug_timestamp(alert.get("last_discord_sent_at")),
+                    "inline": True
+                })
+                if alert.get("last_eventsub_notification_type") or alert.get("last_eventsub_enriched_at"):
+                    fields.append({
+                        "name": "EventSub Delivery",
+                        "value": (
+                            f"type: {alert.get('last_eventsub_notification_type', 'unknown')}\n"
+                            f"enriched: {self._format_debug_timestamp(alert.get('last_eventsub_enriched_at'))}"
+                        ),
                         "inline": False
                     })
             else:
