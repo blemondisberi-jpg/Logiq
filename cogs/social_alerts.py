@@ -138,7 +138,10 @@ class SocialAlerts(commands.Cog):
         )
         if not base_url:
             return None
-        return base_url.rstrip("/") + TWITCH_EVENTSUB_PATH
+        base_url = base_url.strip().rstrip("/")
+        if not base_url.startswith("https://"):
+            return None
+        return base_url + TWITCH_EVENTSUB_PATH
 
     def _eventsub_is_configured(self) -> bool:
         """Whether this deployment is configured for Twitch EventSub webhooks."""
