@@ -220,50 +220,100 @@ def create_app(bot) -> FastAPI:
     @app.post(TWITCH_EVENTSUB_PATH)
     async def twitch_eventsub_webhook(request: Request):
         """Receive Twitch EventSub webhook callbacks."""
-        social_alerts = bot.get_cog("SocialAlerts")
-        if social_alerts is None:
-            raise HTTPException(status_code=503, detail="Social alerts cog is not loaded")
+        try:
+            social_alerts = bot.get_cog("SocialAlerts")
+            if social_alerts is None:
+                raise HTTPException(status_code=503, detail="Social alerts cog is not loaded")
 
-        body = await request.body()
-        message_id = request.headers.get("Twitch-Eventsub-Message-Id", "")
-        timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp", "")
-        signature = request.headers.get("Twitch-Eventsub-Message-Signature", "")
-        message_type = request.headers.get("Twitch-Eventsub-Message-Type", "")
+            body = await request.body()
+            message_id = request.headers.get("Twitch-Eventsub-Message-Id", "")
+            timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp", "")
+            signature = request.headers.get("Twitch-Eventsub-Message-Signature", "")
+            message_type = request.headers.get("Twitch-Eventsub-Message-Type", "")
+            logger.info(
+                "Incoming Twitch EventSub request: type=%s id=%s body_bytes=%s",
+                message_type or "missing",
+                message_id or "missing",
+                len(body),
+            )
 
-        if not message_id or not timestamp or not signature or not message_type:
-            logger.warning("Rejected Twitch EventSub request due to missing headers")
-            raise HTTPException(status_code=400, detail="Missing Twitch EventSub headers")
+            if not message_id or not timestamp or not signature or not message_type:
+                logger.warning("Rejected Twitch EventSub request due to missing headers")
+                raise HTTPException(status_code=400, detail="Missing Twitch EventSub headers")
 
-        sent_at = parse_twitch_rfc3339(timestamp)
-        if sent_at is None:
-            logger.warning("Rejected Twitch EventSub request due to invalid timestamp: %s", timestamp)
-            raise HTTPException(status_code=400, detail="Invalid Twitch EventSub timestamp")
+            sent_at = parse_twitch_rfc3339(timestamp)
+            if sent_at is None:
+                logger.warning("Rejected Twitch EventSub request due to invalid timestamp: %s", timestamp)
+                raise HTTPException(status_code=400, detail="Invalid Twitch EventSub timestamp")
 
-        # Keep replay protection, but don't let strict freshness checks break the one-time webhook verification.
-        if message_type != "webhook_callback_verification":
-            if abs((datetime.now(timezone.utc) - sent_at).total_seconds()) > 600:
-                logger.warning("Rejected Twitch EventSub request because timestamp was too old: %s", timestamp)
-                raise HTTPException(status_code=400, detail="Twitch EventSub message is too old")
+            # Keep replay protection, but don't let strict freshness checks break the one-time webhook verification.
+            if message_type != "webhook_callback_verification":
+                if abs((datetime.now(timezone.utc) - sent_at).total_seconds()) > 600:
+                    logger.warning("Rejected Twitch EventSub request because timestamp was too old: %s", timestamp)
+                    raise HTTPException(status_code=400, detail="Twitch EventSub message is too old")
 
-        if not social_alerts.verify_eventsub_signature(body, message_id, timestamp, signature):
-            logger.warning("Rejected Twitch EventSub request because signature verification failed")
-            raise HTTPException(status_code=403, detail="Invalid Twitch EventSub signature")
+            if not social_alerts.verify_eventsub_signature(body, message_id, timestamp, signature):
+                logger.warning("Rejected Twitch EventSub request because signature verification failed")
+                raise HTTPException(status_code=403, detail="Invalid Twitch EventSub signature")
 
-        if message_id in social_alerts._recent_eventsub_messages:
-            return Response(status_code=200)
+            if message_type != "webhook_callback_verification" and message_id in social_alerts._recent_eventsub_messages:
+                logger.info("Ignoring duplicate Twitch EventSub request id=%s", message_id)
+                return Response(status_code=200)
 
-        social_alerts._recent_eventsub_messages[message_id] = datetime.now(timezone.utc)
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
-        social_alerts._recent_eventsub_messages = {
-            key: value for key, value in social_alerts._recent_eventsub_messages.items() if value >= cutoff
-        }
+            if message_type != "webhook_callback_verification":
+                social_alerts._recent_eventsub_messages[message_id] = datetime.now(timezone.utc)
+                cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+                social_alerts._recent_eventsub_messages = {
+                    key: value
+                    for key, value in list(social_alerts._recent_eventsub_messages.items())
+                    if value >= cutoff
+                }
 
-        payload = json.loads(body.decode("utf-8"))
-        challenge = await social_alerts.handle_twitch_eventsub_request(message_type, payload)
-        if challenge is not None:
-            logger.info("Responding to Twitch EventSub challenge request")
-            return PlainTextResponse(content=challenge)
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except json.JSONDecodeError as error:
+                logger.warning("Rejected Twitch EventSub request due to invalid JSON: %s", error)
+                raise HTTPException(status_code=400, detail="Invalid Twitch EventSub payload")
 
-        return Response(status_code=204)
+            if message_type == "webhook_callback_verification":
+                if not isinstance(payload, dict):
+                    logger.warning("Rejected Twitch EventSub verification because payload was not an object")
+                    raise HTTPException(status_code=400, detail="Invalid Twitch EventSub verification payload")
+
+                challenge = payload.get("challenge")
+                subscription = payload.get("subscription") or {}
+                broadcaster_id = None
+                subscription_type = None
+                if isinstance(subscription, dict):
+                    subscription_type = subscription.get("type")
+                    condition = subscription.get("condition") or {}
+                    if isinstance(condition, dict):
+                        broadcaster_id = condition.get("broadcaster_user_id")
+
+                if not isinstance(challenge, str) or not challenge:
+                    logger.warning("Rejected Twitch EventSub verification because challenge was missing")
+                    raise HTTPException(status_code=400, detail="Missing Twitch EventSub challenge")
+
+                logger.info(
+                    "Responding to Twitch EventSub challenge request for %s (%s)",
+                    subscription_type or "unknown",
+                    broadcaster_id or "unknown",
+                )
+                return PlainTextResponse(content=challenge, media_type="text/plain")
+
+            challenge = await social_alerts.handle_twitch_eventsub_request(message_type, payload)
+            if challenge is not None:
+                logger.info("Responding to Twitch EventSub challenge request")
+                return PlainTextResponse(content=challenge)
+
+            return Response(status_code=204)
+        except HTTPException:
+            raise
+        except Exception as error:
+            logger.exception("Unhandled error while processing Twitch EventSub webhook: %s", error)
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Internal Twitch EventSub webhook error"}
+            )
 
     return app
