@@ -79,6 +79,7 @@ web:
   enabled: true
   host: "0.0.0.0"
   port: 8000
+  public_url: ""
   cors_origins:
     - "http://localhost:3000"
     - "https://yourdomain.com"
@@ -95,6 +96,7 @@ api_keys:
   anthropic: ""
   twitch_client_id: ""
   twitch_client_secret: ""
+  twitch_eventsub_secret: ""
   youtube: ""
   spotify_client_id: ""
   spotify_client_secret: ""

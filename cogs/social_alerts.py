@@ -5,6 +5,7 @@ Monitor Twitch, YouTube, Twitter/X for new content
 
 import asyncio
 import hashlib
+import hmac
 import logging
 import os
 from datetime import datetime, timedelta
@@ -26,6 +27,8 @@ DEFAULT_ALERT_TEMPLATE = (
     "Hey @everyone, **{display_name}** is now live on {url}! Go check it out!"
 )
 TWITCH_EMBED_COLOR = 0x9146FF
+TWITCH_EVENTSUB_PATH = "/webhooks/twitch/eventsub"
+TWITCH_EVENTSUB_TYPES = ("stream.online", "stream.offline")
 
 
 class SocialAlertTemplateModal(discord.ui.Modal):
@@ -98,11 +101,15 @@ class SocialAlerts(commands.Cog):
         self.session = None
         self._twitch_access_token: Optional[str] = None
         self._twitch_token_expires_at: Optional[datetime] = None
+        self._twitch_user_cache: dict[str, dict] = {}
+        self._recent_eventsub_messages: dict[str, datetime] = {}
         self.check_alerts_task.start()
+        self.reconcile_eventsub_task.start()
 
     def cog_unload(self):
         """Cleanup on cog unload"""
         self.check_alerts_task.cancel()
+        self.reconcile_eventsub_task.cancel()
         if self.session:
             asyncio.create_task(self.session.close())
 
@@ -117,6 +124,38 @@ class SocialAlerts(commands.Cog):
         client_id = os.getenv("TWITCH_CLIENT_ID") or self.config.get("api_keys", {}).get("twitch_client_id")
         client_secret = os.getenv("TWITCH_CLIENT_SECRET") or self.config.get("api_keys", {}).get("twitch_client_secret")
         return client_id, client_secret
+
+    def _get_twitch_eventsub_secret(self) -> Optional[str]:
+        """Load the EventSub webhook secret."""
+        return os.getenv("TWITCH_EVENTSUB_SECRET") or self.config.get("api_keys", {}).get("twitch_eventsub_secret")
+
+    def _get_twitch_eventsub_callback_url(self) -> Optional[str]:
+        """Build the public callback URL Twitch should call."""
+        base_url = (
+            os.getenv("TWITCH_EVENTSUB_CALLBACK_URL")
+            or os.getenv("PUBLIC_BASE_URL")
+            or self.config.get("web", {}).get("public_url")
+        )
+        if not base_url:
+            return None
+        return base_url.rstrip("/") + TWITCH_EVENTSUB_PATH
+
+    def _eventsub_is_configured(self) -> bool:
+        """Whether this deployment is configured for Twitch EventSub webhooks."""
+        return bool(self._get_twitch_eventsub_secret() and self._get_twitch_eventsub_callback_url())
+
+    def verify_eventsub_signature(self, body: bytes, message_id: str, timestamp: str, signature: str) -> bool:
+        """Verify Twitch EventSub webhook signatures."""
+        secret = self._get_twitch_eventsub_secret()
+        if not secret:
+            return False
+        digest = hmac.new(
+            secret.encode("utf-8"),
+            msg=message_id.encode("utf-8") + timestamp.encode("utf-8") + body,
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        expected = f"sha256={digest}"
+        return hmac.compare_digest(expected, signature)
 
     def _render_alert_message(self, template: Optional[str], context: dict) -> str:
         """Render a user-configurable alert template with safe fallbacks."""
@@ -211,6 +250,7 @@ class SocialAlerts(commands.Cog):
             f"You'll be notified when {username} {'goes live' if platform == 'twitch' else 'posts new content'}!"
         )
         if platform == "twitch":
+            await self._reconcile_twitch_eventsub_subscriptions()
             await self.check_twitch(alert_data)
             embed.add_field(
                 name="Initial Check",
@@ -247,6 +287,8 @@ class SocialAlerts(commands.Cog):
             f"**Custom Message:**\n{template_preview}"
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+        if platform == "twitch":
+            await self._reconcile_twitch_eventsub_subscriptions()
         logger.info("%s updated %s alert for %s", interaction.user, platform, username)
 
     def _build_twitch_embed(self, stream: dict, user: dict) -> discord.Embed:
@@ -322,6 +364,10 @@ class SocialAlerts(commands.Cog):
 
     async def _fetch_twitch_user(self, username: str) -> tuple[Optional[dict], Optional[str]]:
         """Fetch Twitch user metadata."""
+        cached = self._twitch_user_cache.get(username.lower())
+        if cached and cached.get("expires_at") and discord.utils.utcnow() < cached["expires_at"]:
+            return cached["user"], None
+
         token, token_error = await self._get_twitch_access_token()
         client_id, _ = self._get_twitch_credentials()
         if not token or not client_id:
@@ -351,7 +397,68 @@ class SocialAlerts(commands.Cog):
         users = data.get("data", [])
         if not users:
             return None, f"No Twitch channel found for `{username}`."
-        return users[0], None
+        user = users[0]
+        self._twitch_user_cache[username.lower()] = {
+            "user": user,
+            "expires_at": discord.utils.utcnow() + timedelta(hours=6)
+        }
+        return user, None
+
+    async def _fetch_twitch_users_batch(self, usernames: list[str]) -> tuple[dict[str, dict], Optional[str]]:
+        """Fetch Twitch user metadata in batches and refresh the local cache."""
+        usernames = [username.lower() for username in usernames]
+        resolved: dict[str, dict] = {}
+        uncached = []
+
+        now = discord.utils.utcnow()
+        for username in usernames:
+            cached = self._twitch_user_cache.get(username)
+            if cached and cached.get("expires_at") and now < cached["expires_at"]:
+                resolved[username] = cached["user"]
+            else:
+                uncached.append(username)
+
+        if not uncached:
+            return resolved, None
+
+        token, token_error = await self._get_twitch_access_token()
+        client_id, _ = self._get_twitch_credentials()
+        if not token or not client_id:
+            return resolved, token_error or "Twitch credentials are unavailable."
+
+        session = await self.get_session()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Client-Id": client_id
+        }
+
+        try:
+            for index in range(0, len(uncached), 100):
+                batch = uncached[index:index + 100]
+                params = [("login", username) for username in batch]
+                async with session.get(
+                    "https://api.twitch.tv/helix/users",
+                    params=params,
+                    headers=headers
+                ) as response:
+                    if response.status != 200:
+                        body = await response.text()
+                        logger.error("Failed batch Twitch user lookup: %s %s", response.status, body)
+                        return resolved, f"Twitch user lookup failed with HTTP {response.status}."
+                    data = await response.json()
+
+                for user in data.get("data", []):
+                    login = user["login"].lower()
+                    self._twitch_user_cache[login] = {
+                        "user": user,
+                        "expires_at": discord.utils.utcnow() + timedelta(hours=6)
+                    }
+                    resolved[login] = user
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching Twitch user batch: %s", error, exc_info=True)
+            return resolved, "Could not contact Twitch while looking up channels."
+
+        return resolved, None
 
     async def _fetch_twitch_stream(self, user_id: str) -> tuple[Optional[dict], Optional[str]]:
         """Fetch current live Twitch stream for a user ID."""
@@ -383,6 +490,325 @@ class SocialAlerts(commands.Cog):
 
         streams = data.get("data", [])
         return (streams[0] if streams else None), None
+
+    async def _fetch_twitch_streams_batch(self, user_ids: list[str]) -> tuple[dict[str, dict], Optional[str]]:
+        """Fetch current live streams for multiple Twitch user IDs in batches."""
+        if not user_ids:
+            return {}, None
+
+        token, token_error = await self._get_twitch_access_token()
+        client_id, _ = self._get_twitch_credentials()
+        if not token or not client_id:
+            return {}, token_error or "Twitch credentials are unavailable."
+
+        session = await self.get_session()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Client-Id": client_id
+        }
+        results: dict[str, dict] = {}
+
+        try:
+            for index in range(0, len(user_ids), 100):
+                batch = user_ids[index:index + 100]
+                params = [("user_id", user_id) for user_id in batch]
+                async with session.get(
+                    "https://api.twitch.tv/helix/streams",
+                    params=params,
+                    headers=headers
+                ) as response:
+                    if response.status != 200:
+                        body = await response.text()
+                        logger.error("Failed batch Twitch stream lookup: %s %s", response.status, body)
+                        return {}, f"Twitch stream lookup failed with HTTP {response.status}."
+                    data = await response.json()
+
+                for stream in data.get("data", []):
+                    results[stream["user_id"]] = stream
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching Twitch stream batch: %s", error, exc_info=True)
+            return {}, "Could not contact Twitch while checking live status."
+
+        return results, None
+
+    async def _list_twitch_eventsub_subscriptions(self) -> tuple[list[dict], Optional[str]]:
+        """List current Twitch EventSub subscriptions for this application."""
+        token, token_error = await self._get_twitch_access_token()
+        client_id, _ = self._get_twitch_credentials()
+        if not token or not client_id:
+            return [], token_error or "Twitch credentials are unavailable."
+
+        session = await self.get_session()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Client-Id": client_id
+        }
+
+        subscriptions = []
+        cursor = None
+        try:
+            while True:
+                params = {"after": cursor} if cursor else None
+                async with session.get(
+                    "https://api.twitch.tv/helix/eventsub/subscriptions",
+                    params=params,
+                    headers=headers
+                ) as response:
+                    if response.status != 200:
+                        body = await response.text()
+                        logger.error("Failed to list Twitch EventSub subscriptions: %s %s", response.status, body)
+                        return [], f"Twitch EventSub listing failed with HTTP {response.status}."
+                    data = await response.json()
+
+                subscriptions.extend(data.get("data", []))
+                cursor = data.get("pagination", {}).get("cursor")
+                if not cursor:
+                    break
+        except aiohttp.ClientError as error:
+            logger.error("Error listing Twitch EventSub subscriptions: %s", error, exc_info=True)
+            return [], "Could not contact Twitch while listing EventSub subscriptions."
+
+        return subscriptions, None
+
+    async def _create_twitch_eventsub_subscription(self, broadcaster_id: str, event_type: str) -> tuple[bool, Optional[str]]:
+        """Create a Twitch EventSub webhook subscription."""
+        callback_url = self._get_twitch_eventsub_callback_url()
+        secret = self._get_twitch_eventsub_secret()
+        token, token_error = await self._get_twitch_access_token()
+        client_id, _ = self._get_twitch_credentials()
+        if not callback_url or not secret:
+            return False, "EventSub callback URL or secret is missing."
+        if not token or not client_id:
+            return False, token_error or "Twitch credentials are unavailable."
+
+        session = await self.get_session()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Client-Id": client_id,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "type": event_type,
+            "version": "1",
+            "condition": {"broadcaster_user_id": broadcaster_id},
+            "transport": {
+                "method": "webhook",
+                "callback": callback_url,
+                "secret": secret
+            }
+        }
+
+        try:
+            async with session.post(
+                "https://api.twitch.tv/helix/eventsub/subscriptions",
+                headers=headers,
+                json=payload
+            ) as response:
+                if response.status not in (202, 409):
+                    body = await response.text()
+                    logger.error("Failed to create Twitch EventSub subscription: %s %s", response.status, body)
+                    return False, f"Twitch EventSub creation failed with HTTP {response.status}."
+        except aiohttp.ClientError as error:
+            logger.error("Error creating Twitch EventSub subscription: %s", error, exc_info=True)
+            return False, "Could not contact Twitch while creating an EventSub subscription."
+
+        return True, None
+
+    async def _delete_twitch_eventsub_subscription(self, subscription_id: str) -> tuple[bool, Optional[str]]:
+        """Delete a Twitch EventSub subscription."""
+        token, token_error = await self._get_twitch_access_token()
+        client_id, _ = self._get_twitch_credentials()
+        if not token or not client_id:
+            return False, token_error or "Twitch credentials are unavailable."
+
+        session = await self.get_session()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Client-Id": client_id
+        }
+
+        try:
+            async with session.delete(
+                "https://api.twitch.tv/helix/eventsub/subscriptions",
+                params={"id": subscription_id},
+                headers=headers
+            ) as response:
+                if response.status not in (204, 404):
+                    body = await response.text()
+                    logger.error("Failed to delete Twitch EventSub subscription %s: %s %s", subscription_id, response.status, body)
+                    return False, f"Twitch EventSub deletion failed with HTTP {response.status}."
+        except aiohttp.ClientError as error:
+            logger.error("Error deleting Twitch EventSub subscription %s: %s", subscription_id, error, exc_info=True)
+            return False, "Could not contact Twitch while deleting an EventSub subscription."
+
+        return True, None
+
+    async def _reconcile_twitch_eventsub_subscriptions(self) -> None:
+        """Ensure Twitch EventSub subscriptions exist for configured Twitch alerts."""
+        if not self._eventsub_is_configured():
+            return
+
+        cursor = self.db.db.social_alerts.find({"platform": "twitch"})
+        alerts = await cursor.to_list(length=1000)
+        if not alerts:
+            return
+
+        usernames = sorted({alert["username"].lower() for alert in alerts})
+        users_by_login, user_error = await self._fetch_twitch_users_batch(usernames)
+        if user_error:
+            logger.warning("Skipping EventSub reconcile because Twitch users could not be resolved: %s", user_error)
+            return
+
+        desired_broadcasters: dict[str, str] = {}
+        for alert in alerts:
+            user = users_by_login.get(alert["username"].lower())
+            if not user:
+                continue
+            desired_broadcasters[user["id"]] = user["login"].lower()
+            if alert.get("twitch_broadcaster_id") != user["id"]:
+                await self.db.db.social_alerts.update_one(
+                    {"_id": alert["_id"]},
+                    {"$set": {"twitch_broadcaster_id": user["id"]}}
+                )
+
+        subscriptions, sub_error = await self._list_twitch_eventsub_subscriptions()
+        if sub_error:
+            logger.warning("Skipping EventSub reconcile because current subscriptions could not be listed: %s", sub_error)
+            return
+
+        callback_url = self._get_twitch_eventsub_callback_url()
+        existing_map = {}
+        for subscription in subscriptions:
+            if subscription.get("type") not in TWITCH_EVENTSUB_TYPES:
+                continue
+            transport = subscription.get("transport", {})
+            if transport.get("method") != "webhook" or transport.get("callback") != callback_url:
+                continue
+            broadcaster_id = subscription.get("condition", {}).get("broadcaster_user_id")
+            if not broadcaster_id:
+                continue
+            existing_map[(broadcaster_id, subscription["type"])] = subscription
+
+        for broadcaster_id in desired_broadcasters:
+            for event_type in TWITCH_EVENTSUB_TYPES:
+                if (broadcaster_id, event_type) not in existing_map:
+                    ok, error = await self._create_twitch_eventsub_subscription(broadcaster_id, event_type)
+                    if not ok:
+                        logger.warning("Failed to ensure EventSub %s for broadcaster %s: %s", event_type, broadcaster_id, error)
+
+        desired_pairs = {(broadcaster_id, event_type) for broadcaster_id in desired_broadcasters for event_type in TWITCH_EVENTSUB_TYPES}
+        for key, subscription in existing_map.items():
+            if key not in desired_pairs:
+                ok, error = await self._delete_twitch_eventsub_subscription(subscription["id"])
+                if not ok:
+                    logger.warning("Failed to delete orphan EventSub subscription %s: %s", subscription["id"], error)
+
+    async def handle_twitch_eventsub_request(self, message_type: str, payload: dict) -> Optional[str]:
+        """Process Twitch EventSub webhook payloads."""
+        if message_type == "webhook_callback_verification":
+            subscription = payload.get("subscription", {})
+            logger.info(
+                "Verified Twitch EventSub subscription for %s (%s)",
+                subscription.get("type"),
+                subscription.get("condition", {}).get("broadcaster_user_id")
+            )
+            return payload.get("challenge", "")
+
+        if message_type == "revocation":
+            subscription = payload.get("subscription", {})
+            logger.warning(
+                "Twitch EventSub subscription revoked for %s (%s): %s",
+                subscription.get("type"),
+                subscription.get("condition", {}).get("broadcaster_user_id"),
+                subscription.get("status")
+            )
+            return None
+
+        if message_type != "notification":
+            return None
+
+        subscription = payload.get("subscription", {})
+        event = payload.get("event", {})
+        subscription_type = subscription.get("type")
+        broadcaster_id = event.get("broadcaster_user_id") or subscription.get("condition", {}).get("broadcaster_user_id")
+        if not broadcaster_id or subscription_type not in TWITCH_EVENTSUB_TYPES:
+            return None
+
+        alerts = await self.db.db.social_alerts.find({
+            "platform": "twitch",
+            "$or": [
+                {"twitch_broadcaster_id": broadcaster_id},
+                {"username": event.get("broadcaster_user_login", "").lower()}
+            ]
+        }).to_list(length=1000)
+
+        if not alerts:
+            return None
+
+        if subscription_type == "stream.offline":
+            for alert in alerts:
+                await self._save_alert_check_state(alert["_id"], status="offline", error=None, stream_id=None)
+                if alert.get("last_content_id") is not None:
+                    await self.db.db.social_alerts.update_one(
+                        {"_id": alert["_id"]},
+                        {"$set": {"last_content_id": None}}
+                    )
+            return None
+
+        user_login = event.get("broadcaster_user_login")
+        if user_login:
+            user = None
+            user_error = None
+            cached = self._twitch_user_cache.get(user_login.lower())
+            if cached and cached.get("expires_at") and discord.utils.utcnow() < cached["expires_at"]:
+                user = cached["user"]
+            else:
+                user, user_error = await self._fetch_twitch_user(user_login.lower())
+            if not user:
+                logger.warning("EventSub received live event but Twitch user lookup failed for %s: %s", user_login, user_error)
+                return None
+        else:
+            streamless_user = {"id": broadcaster_id, "login": "", "display_name": event.get("broadcaster_user_name") or "Unknown"}
+            user = streamless_user
+
+        stream, stream_error = await self._fetch_twitch_stream(broadcaster_id)
+        if stream_error or not stream:
+            logger.warning("EventSub received live event but stream fetch failed for broadcaster %s: %s", broadcaster_id, stream_error or "No stream returned")
+            return None
+
+        for alert in alerts:
+            guild = self.bot.get_guild(alert["guild_id"])
+            if not guild:
+                continue
+            channel = guild.get_channel(alert["channel_id"])
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            if stream["id"] == alert.get("last_content_id"):
+                await self._save_alert_check_state(
+                    alert["_id"],
+                    status="already_announced",
+                    error=None,
+                    stream_id=stream["id"],
+                    stream_title=stream.get("title"),
+                    stream_started_at=stream.get("started_at")
+                )
+                continue
+
+            sent = await self._send_twitch_alert(alert, channel, stream, user)
+            if sent:
+                await self._save_alert_check_state(
+                    alert["_id"],
+                    status="sent",
+                    error=None,
+                    stream_id=stream["id"],
+                    stream_title=stream.get("title"),
+                    stream_started_at=stream.get("started_at")
+                )
+            else:
+                await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
+
+        return None
 
     async def _send_twitch_alert(
         self,
@@ -446,19 +872,93 @@ class SocialAlerts(commands.Cog):
                 )
                 return False
 
-    @tasks.loop(minutes=5)
+    async def _check_twitch_alerts_batch(self, alerts: list[dict]) -> None:
+        """Check all Twitch alerts using batched Twitch API requests."""
+        usernames = sorted({alert["username"].lower() for alert in alerts})
+        users_by_login, user_error = await self._fetch_twitch_users_batch(usernames)
+        if user_error:
+            for alert in alerts:
+                await self._save_alert_check_state(alert["_id"], status="user_lookup_failed", error=user_error)
+            return
+
+        user_ids = sorted({user["id"] for user in users_by_login.values()})
+        streams_by_user_id, stream_error = await self._fetch_twitch_streams_batch(user_ids)
+        if stream_error:
+            for alert in alerts:
+                await self._save_alert_check_state(alert["_id"], status="stream_lookup_failed", error=stream_error)
+            return
+
+        for alert in alerts:
+            username = alert["username"].lower()
+            user = users_by_login.get(username)
+            if not user:
+                await self._save_alert_check_state(
+                    alert["_id"],
+                    status="user_lookup_failed",
+                    error=f"No Twitch channel found for `{username}`."
+                )
+                continue
+
+            stream = streams_by_user_id.get(user["id"])
+            if not stream:
+                await self._save_alert_check_state(alert["_id"], status="offline", error=None, stream_id=None)
+                if alert.get("last_content_id") is not None:
+                    await self.db.db.social_alerts.update_one(
+                        {"_id": alert["_id"]},
+                        {"$set": {"last_content_id": None}}
+                    )
+                continue
+
+            if stream["id"] == alert.get("last_content_id"):
+                await self._save_alert_check_state(
+                    alert["_id"],
+                    status="already_announced",
+                    error=None,
+                    stream_id=stream["id"],
+                    stream_title=stream.get("title"),
+                    stream_started_at=stream.get("started_at")
+                )
+                continue
+
+            guild = self.bot.get_guild(alert["guild_id"])
+            if not guild:
+                logger.warning("Guild %s not found for Twitch alert %s", alert["guild_id"], username)
+                continue
+
+            channel = guild.get_channel(alert["channel_id"])
+            if not isinstance(channel, discord.TextChannel):
+                logger.warning("Channel %s not found for Twitch alert %s", alert["channel_id"], username)
+                await self._save_alert_check_state(alert["_id"], status="channel_missing", error="Alert channel not found.")
+                continue
+
+            sent = await self._send_twitch_alert(alert, channel, stream, user)
+            if sent:
+                await self._save_alert_check_state(
+                    alert["_id"],
+                    status="sent",
+                    error=None,
+                    stream_id=stream["id"],
+                    stream_title=stream.get("title"),
+                    stream_started_at=stream.get("started_at")
+                )
+            else:
+                await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
+
+    @tasks.loop(seconds=15)
     async def check_alerts_task(self):
         """Check for new content from monitored accounts"""
         try:
             cursor = self.db.db.social_alerts.find({})
             alerts = await cursor.to_list(length=1000)
 
+            twitch_alerts = [alert for alert in alerts if alert.get("platform") == "twitch"]
+            if twitch_alerts and not self._eventsub_is_configured():
+                await self._check_twitch_alerts_batch(twitch_alerts)
+
             for alert in alerts:
                 try:
                     platform = alert["platform"]
-                    if platform == "twitch":
-                        await self.check_twitch(alert)
-                    elif platform == "youtube":
+                    if platform == "youtube":
                         await self.check_youtube(alert)
                     elif platform == "twitter":
                         await self.check_twitter(alert)
@@ -470,6 +970,19 @@ class SocialAlerts(commands.Cog):
     @check_alerts_task.before_loop
     async def before_check_alerts(self):
         """Wait for bot to be ready"""
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=15)
+    async def reconcile_eventsub_task(self):
+        """Reconcile Twitch EventSub subscriptions for configured Twitch alerts."""
+        try:
+            await self._reconcile_twitch_eventsub_subscriptions()
+        except Exception as error:
+            logger.error("Error reconciling Twitch EventSub subscriptions: %s", error, exc_info=True)
+
+    @reconcile_eventsub_task.before_loop
+    async def before_reconcile_eventsub(self):
+        """Wait for bot readiness before managing EventSub."""
         await self.bot.wait_until_ready()
 
     async def check_twitch(self, alert: dict):
@@ -690,6 +1203,8 @@ class SocialAlerts(commands.Cog):
             f"Removed {platform} alert for **{username}**"
         )
         await interaction.response.send_message(embed=embed)
+        if platform == "twitch":
+            await self._reconcile_twitch_eventsub_subscriptions()
         logger.info("%s removed %s alert for %s", interaction.user, platform, username)
 
     @app_commands.command(name="alert-list", description="List all social media alerts (Admin)")
@@ -872,6 +1387,16 @@ class SocialAlerts(commands.Cog):
                 "name": "Credentials Loaded",
                 "value": "Yes" if client_id and client_secret else "No",
                 "inline": True
+            })
+            fields.append({
+                "name": "Delivery Mode",
+                "value": "EventSub Webhook" if self._eventsub_is_configured() else "Polling",
+                "inline": True
+            })
+            fields.append({
+                "name": "Callback URL",
+                "value": self._get_twitch_eventsub_callback_url() or "Not configured",
+                "inline": False
             })
             user, user_error = await self._fetch_twitch_user(username.lower())
             if user:

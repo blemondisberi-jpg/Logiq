@@ -3,16 +3,19 @@ FastAPI Web Dashboard for Logiq
 REST API endpoints for bot statistics and management
 """
 
-from fastapi import FastAPI, HTTPException, Depends
+from datetime import datetime, timedelta, timezone
+import json
+
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
 import logging
 import os
 
 logger = logging.getLogger(__name__)
+TWITCH_EVENTSUB_PATH = "/webhooks/twitch/eventsub"
 
 
 def create_app(bot) -> FastAPI:
@@ -194,5 +197,48 @@ def create_app(bot) -> FastAPI:
                 for name, config in modules.items()
             }
         }
+
+    @app.post(TWITCH_EVENTSUB_PATH)
+    async def twitch_eventsub_webhook(request: Request):
+        """Receive Twitch EventSub webhook callbacks."""
+        social_alerts = bot.get_cog("SocialAlerts")
+        if social_alerts is None:
+            raise HTTPException(status_code=503, detail="Social alerts cog is not loaded")
+
+        body = await request.body()
+        message_id = request.headers.get("Twitch-Eventsub-Message-Id", "")
+        timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp", "")
+        signature = request.headers.get("Twitch-Eventsub-Message-Signature", "")
+        message_type = request.headers.get("Twitch-Eventsub-Message-Type", "")
+
+        if not message_id or not timestamp or not signature or not message_type:
+            raise HTTPException(status_code=400, detail="Missing Twitch EventSub headers")
+
+        try:
+            sent_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Twitch EventSub timestamp")
+
+        if abs((datetime.now(timezone.utc) - sent_at).total_seconds()) > 600:
+            raise HTTPException(status_code=400, detail="Twitch EventSub message is too old")
+
+        if not social_alerts.verify_eventsub_signature(body, message_id, timestamp, signature):
+            raise HTTPException(status_code=403, detail="Invalid Twitch EventSub signature")
+
+        if message_id in social_alerts._recent_eventsub_messages:
+            return Response(status_code=200)
+
+        social_alerts._recent_eventsub_messages[message_id] = datetime.now(timezone.utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        social_alerts._recent_eventsub_messages = {
+            key: value for key, value in social_alerts._recent_eventsub_messages.items() if value >= cutoff
+        }
+
+        payload = json.loads(body.decode("utf-8"))
+        challenge = await social_alerts.handle_twitch_eventsub_request(message_type, payload)
+        if challenge is not None:
+            return PlainTextResponse(content=challenge)
+
+        return Response(status_code=204)
 
     return app
