@@ -11,6 +11,8 @@ from typing import Optional
 import logging
 import random
 import asyncio
+from bson import ObjectId
+from bson.errors import InvalidId
 
 from utils.embeds import EmbedFactory, EmbedColor
 from utils.permissions import is_admin
@@ -31,11 +33,22 @@ class GiveawayView(discord.ui.View):
     @discord.ui.button(label="🎉 Enter Giveaway", style=discord.ButtonStyle.success, custom_id="giveaway_enter")
     async def enter_giveaway(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Handle giveaway entry"""
+        await interaction.response.defer(ephemeral=True)
+
         # Get giveaway from database
-        giveaway = await self.cog.db.db.giveaways.find_one({"_id": self.giveaway_id})
+        try:
+            giveaway_object_id = ObjectId(self.giveaway_id)
+        except InvalidId:
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Error", "Giveaway ID is invalid"),
+                ephemeral=True
+            )
+            return
+
+        giveaway = await self.cog.db.db.giveaways.find_one({"_id": giveaway_object_id})
         
         if not giveaway:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=EmbedFactory.error("Error", "Giveaway not found"),
                 ephemeral=True
             )
@@ -43,7 +56,7 @@ class GiveawayView(discord.ui.View):
 
         # Check if already ended
         if giveaway.get('ended', False):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=EmbedFactory.error("Giveaway Ended", "This giveaway has already ended"),
                 ephemeral=True
             )
@@ -52,7 +65,7 @@ class GiveawayView(discord.ui.View):
         # Check if user already entered
         participants = giveaway.get('participants', [])
         if interaction.user.id in participants:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=EmbedFactory.warning("Already Entered", "You have already entered this giveaway!"),
                 ephemeral=True
             )
@@ -60,11 +73,11 @@ class GiveawayView(discord.ui.View):
 
         # Add user to participants
         await self.cog.db.db.giveaways.update_one(
-            {"_id": self.giveaway_id},
+            {"_id": giveaway_object_id},
             {"$push": {"participants": interaction.user.id}}
         )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=EmbedFactory.success("Entered!", f"You have been entered into the giveaway for **{giveaway['prize']}**!"),
             ephemeral=True
         )
@@ -81,10 +94,35 @@ class Giveaways(commands.Cog):
         self.module_config = config.get('modules', {}).get('giveaways', {})
         # Start giveaway checker
         self.giveaway_task = self.bot.loop.create_task(self.check_giveaways())
+        self.bot.loop.create_task(self._register_persistent_views())
 
     def cog_unload(self):
         """Cleanup on cog unload"""
         self.giveaway_task.cancel()
+
+    async def _register_persistent_views(self):
+        """Restore active giveaway views after restart."""
+        await self.bot.wait_until_ready()
+        restored = 0
+
+        active_giveaways = await self.db.db.giveaways.find({
+            "ended": False,
+            "message_id": {"$exists": True}
+        }).to_list(length=1000)
+
+        for giveaway in active_giveaways:
+            message_id = giveaway.get("message_id")
+            giveaway_id = giveaway.get("_id")
+            if not message_id or giveaway_id is None:
+                continue
+
+            try:
+                self.bot.add_view(GiveawayView(str(giveaway_id), self), message_id=int(message_id))
+                restored += 1
+            except Exception as error:
+                logger.warning("Failed to restore giveaway view %s: %s", giveaway_id, error)
+
+        logger.info("Giveaway persistent views ready (%s restored)", restored)
 
     async def check_giveaways(self):
         """Background task to check for ended giveaways"""
@@ -239,7 +277,12 @@ class Giveaways(commands.Cog):
         view = GiveawayView(giveaway_id, self)
         
         await interaction.response.send_message("🎉 Giveaway started!", ephemeral=True)
-        await interaction.channel.send(embed=embed, view=view)
+        message = await interaction.channel.send(embed=embed, view=view)
+        await self.db.db.giveaways.update_one(
+            {"_id": result.inserted_id},
+            {"$set": {"message_id": message.id}}
+        )
+        self.bot.add_view(view, message_id=message.id)
 
         logger.info(f"{interaction.user} started giveaway in {interaction.guild}")
 

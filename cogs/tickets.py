@@ -15,6 +15,7 @@ from utils.permissions import is_admin
 from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
+TICKET_PANEL_COLLECTION = "ticket_panels"
 
 
 class TicketCreateView(discord.ui.View):
@@ -51,6 +52,36 @@ class Tickets(commands.Cog):
         self.db = db
         self.config = config
         self.module_config = config.get('modules', {}).get('tickets', {})
+        self.bot.loop.create_task(self._register_persistent_views())
+
+    async def _register_persistent_views(self):
+        """Register persistent ticket views after restart."""
+        await self.bot.wait_until_ready()
+        restored_panels = 0
+
+        self.bot.add_view(TicketControlView(self))
+
+        stored_panels = await self.db.db[TICKET_PANEL_COLLECTION].find({}).to_list(length=1000)
+        for panel in stored_panels:
+            try:
+                self.bot.add_view(TicketCreateView(self), message_id=int(panel["message_id"]))
+                restored_panels += 1
+            except Exception as error:
+                logger.warning("Failed to restore ticket panel %s: %s", panel.get("message_id"), error)
+
+        logger.info("Ticket persistent views ready (%s panels restored)", restored_panels)
+
+    async def _store_ticket_panel(self, *, guild_id: int, channel_id: int, message_id: int) -> None:
+        """Persist a ticket panel message for future re-registration."""
+        await self.db.db[TICKET_PANEL_COLLECTION].update_one(
+            {"message_id": message_id},
+            {"$set": {
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "message_id": message_id
+            }},
+            upsert=True
+        )
 
     async def create_ticket_for_user(self, interaction: discord.Interaction):
         """Create a ticket for a user"""
@@ -95,6 +126,8 @@ class Tickets(commands.Cog):
             return
 
         try:
+            await interaction.response.defer(ephemeral=True)
+
             # Create ticket channel
             overwrites = {
                 interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -156,7 +189,7 @@ class Tickets(commands.Cog):
                     )
                     await log_channel.send(embed=log_embed)
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=EmbedFactory.success(
                     "Ticket Created",
                     f"Your ticket has been created: {channel.mention}"
@@ -167,7 +200,8 @@ class Tickets(commands.Cog):
             logger.info(f"Ticket created for {interaction.user} in {interaction.guild}")
 
         except discord.Forbidden:
-            await interaction.response.send_message(
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
                 embed=EmbedFactory.error("Error", "I don't have permission to create channels"),
                 ephemeral=True
             )
@@ -289,6 +323,8 @@ class Tickets(commands.Cog):
     @is_admin()
     async def ticket_panel(self, interaction: discord.Interaction):
         """Send persistent ticket panel (ADMIN ONLY)"""
+        await interaction.response.defer(ephemeral=True)
+
         embed = EmbedFactory.create(
             title="🎫 Support Tickets",
             description="Need help? Click the button below to create a support ticket!\n\n"
@@ -297,9 +333,14 @@ class Tickets(commands.Cog):
         )
 
         view = TicketCreateView(self)
-        await interaction.channel.send(embed=embed, view=view)
+        message = await interaction.channel.send(embed=embed, view=view)
+        await self._store_ticket_panel(
+            guild_id=interaction.guild.id,
+            channel_id=interaction.channel.id,
+            message_id=message.id
+        )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=EmbedFactory.success("Panel Sent", "Ticket panel created with persistent button!"),
             ephemeral=True
         )

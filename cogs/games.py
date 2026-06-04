@@ -185,6 +185,16 @@ class Games(commands.Cog):
         self.config = config
         self.module_config = config.get('modules', {}).get('games', {})
         self.trivia_questions = self._load_trivia()
+        self.bot.loop.create_task(self._register_persistent_views())
+
+    async def _register_persistent_views(self):
+        """Register long-lived game buttons after restart."""
+        await self.bot.wait_until_ready()
+        self.bot.add_view(DiceGameView(self))
+        self.bot.add_view(CoinFlipView(self))
+        self.bot.add_view(TriviaStartView(self))
+        self.bot.add_view(EightBallView(self))
+        logger.info("Game persistent views ready")
 
     def _load_trivia(self):
         """Load trivia questions"""
@@ -270,6 +280,8 @@ class Games(commands.Cog):
     @is_admin()
     async def setup_game_panel(self, interaction: discord.Interaction):
         """Setup game panel"""
+        await interaction.response.defer(ephemeral=True)
+
         embed = EmbedFactory.create(
             title="🎮 Game Center",
             description="Click the buttons below to play games!\n\n"
@@ -299,7 +311,7 @@ class Games(commands.Cog):
         ball_embed = EmbedFactory.create(title="🔮 Magic 8-Ball", description="Ask the magic 8-ball a question!", color=EmbedColor.INFO)
         await interaction.channel.send(embed=ball_embed, view=EightBallView(self))
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=EmbedFactory.success("Game Panel Created", "Users can now play games by clicking buttons!"),
             ephemeral=True
         )
