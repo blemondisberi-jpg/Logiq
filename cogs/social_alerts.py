@@ -142,8 +142,7 @@ class SocialAlerts(commands.Cog):
         cache_key_parts = [
             str(stream.get("id") or ""),
             str(stream.get("started_at") or ""),
-            str(stream.get("title") or ""),
-            str(stream.get("viewer_count") or 0)
+            str(stream.get("title") or "")
         ]
         cache_key = hashlib.md5("|".join(cache_key_parts).encode("utf-8")).hexdigest()[:12]
         separator = "&" if "?" in preview_url else "?"
@@ -418,8 +417,34 @@ class SocialAlerts(commands.Cog):
             logger.warning("Missing permissions to send Twitch alert in channel %s", channel.id)
             return False
         except discord.HTTPException as error:
-            logger.error("Failed to send Twitch alert for %s: %s", alert["username"], error, exc_info=True)
-            return False
+            logger.warning(
+                "Primary Twitch alert send failed for %s, retrying without preview image: %s",
+                alert["username"],
+                error,
+                exc_info=True
+            )
+
+            fallback_embed = self._build_twitch_embed(stream, user)
+            fallback_embed.set_image(url=None)
+
+            try:
+                await channel.send(
+                    content=content,
+                    embed=fallback_embed,
+                    allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True)
+                )
+                return True
+            except discord.Forbidden:
+                logger.warning("Missing permissions to send fallback Twitch alert in channel %s", channel.id)
+                return False
+            except discord.HTTPException as fallback_error:
+                logger.error(
+                    "Failed to send fallback Twitch alert for %s: %s",
+                    alert["username"],
+                    fallback_error,
+                    exc_info=True
+                )
+                return False
 
     @tasks.loop(minutes=5)
     async def check_alerts_task(self):
