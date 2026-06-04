@@ -212,6 +212,26 @@ class SocialAlerts(commands.Cog):
 
         await self.db.db.social_alerts.update_one({"_id": alert_id}, {"$set": update_data})
 
+    async def _save_eventsub_state(
+        self,
+        alert_id,
+        *,
+        online_status: Optional[str] = None,
+        offline_status: Optional[str] = None,
+        error: Optional[str] = None
+    ) -> None:
+        """Persist EventSub subscription diagnostics for an alert."""
+        update_data = {
+            "eventsub_last_checked": discord.utils.utcnow().timestamp(),
+            "eventsub_last_error": error
+        }
+        if online_status is not None:
+            update_data["eventsub_online_status"] = online_status
+        if offline_status is not None:
+            update_data["eventsub_offline_status"] = offline_status
+
+        await self.db.db.social_alerts.update_one({"_id": alert_id}, {"$set": update_data})
+
     async def _create_alert_record(
         self,
         interaction: discord.Interaction,
@@ -643,28 +663,49 @@ class SocialAlerts(commands.Cog):
 
         return True, None
 
-    async def _reconcile_twitch_eventsub_subscriptions(self) -> None:
+    async def _reconcile_twitch_eventsub_subscriptions(self) -> dict[str, int]:
         """Ensure Twitch EventSub subscriptions exist for configured Twitch alerts."""
+        summary = {
+            "alerts": 0,
+            "resolved": 0,
+            "created": 0,
+            "deleted": 0,
+            "failed": 0,
+            "healthy": 0,
+            "missing": 0,
+        }
         if not self._eventsub_is_configured():
-            return
+            return summary
 
         cursor = self.db.db.social_alerts.find({"platform": "twitch"})
         alerts = await cursor.to_list(length=1000)
+        summary["alerts"] = len(alerts)
         if not alerts:
-            return
+            return summary
 
         usernames = sorted({alert["username"].lower() for alert in alerts})
         users_by_login, user_error = await self._fetch_twitch_users_batch(usernames)
         if user_error:
             logger.warning("Skipping EventSub reconcile because Twitch users could not be resolved: %s", user_error)
-            return
+            summary["failed"] = len(alerts)
+            for alert in alerts:
+                await self._save_eventsub_state(alert["_id"], error=user_error)
+            return summary
 
         desired_broadcasters: dict[str, str] = {}
         for alert in alerts:
             user = users_by_login.get(alert["username"].lower())
             if not user:
+                summary["failed"] += 1
+                await self._save_eventsub_state(
+                    alert["_id"],
+                    online_status="missing",
+                    offline_status="missing",
+                    error=f"No Twitch channel found for `{alert['username']}`."
+                )
                 continue
             desired_broadcasters[user["id"]] = user["login"].lower()
+            summary["resolved"] += 1
             if alert.get("twitch_broadcaster_id") != user["id"]:
                 await self.db.db.social_alerts.update_one(
                     {"_id": alert["_id"]},
@@ -674,7 +715,10 @@ class SocialAlerts(commands.Cog):
         subscriptions, sub_error = await self._list_twitch_eventsub_subscriptions()
         if sub_error:
             logger.warning("Skipping EventSub reconcile because current subscriptions could not be listed: %s", sub_error)
-            return
+            summary["failed"] += len(desired_broadcasters)
+            for alert in alerts:
+                await self._save_eventsub_state(alert["_id"], error=sub_error)
+            return summary
 
         callback_url = self._get_twitch_eventsub_callback_url()
         existing_map = {}
@@ -694,14 +738,57 @@ class SocialAlerts(commands.Cog):
                 if (broadcaster_id, event_type) not in existing_map:
                     ok, error = await self._create_twitch_eventsub_subscription(broadcaster_id, event_type)
                     if not ok:
+                        summary["failed"] += 1
                         logger.warning("Failed to ensure EventSub %s for broadcaster %s: %s", event_type, broadcaster_id, error)
+                    else:
+                        summary["created"] += 1
 
         desired_pairs = {(broadcaster_id, event_type) for broadcaster_id in desired_broadcasters for event_type in TWITCH_EVENTSUB_TYPES}
         for key, subscription in existing_map.items():
             if key not in desired_pairs:
                 ok, error = await self._delete_twitch_eventsub_subscription(subscription["id"])
                 if not ok:
+                    summary["failed"] += 1
                     logger.warning("Failed to delete orphan EventSub subscription %s: %s", subscription["id"], error)
+                else:
+                    summary["deleted"] += 1
+
+        refreshed_subscriptions, refreshed_error = await self._list_twitch_eventsub_subscriptions()
+        status_lookup = {}
+        if not refreshed_error:
+            for subscription in refreshed_subscriptions:
+                if subscription.get("type") not in TWITCH_EVENTSUB_TYPES:
+                    continue
+                if subscription.get("condition", {}).get("broadcaster_user_id") not in desired_broadcasters:
+                    continue
+                transport = subscription.get("transport", {})
+                if transport.get("method") != "webhook" or transport.get("callback") != callback_url:
+                    continue
+                status_lookup[(subscription["condition"]["broadcaster_user_id"], subscription["type"])] = subscription.get("status", "unknown")
+
+        for alert in alerts:
+            broadcaster_id = alert.get("twitch_broadcaster_id")
+            if not broadcaster_id:
+                continue
+
+            online_status = status_lookup.get((broadcaster_id, "stream.online"), "missing")
+            offline_status = status_lookup.get((broadcaster_id, "stream.offline"), "missing")
+            error = refreshed_error
+            if not error and ("missing" in (online_status, offline_status)):
+                error = "One or more Twitch EventSub subscriptions are missing."
+
+            await self._save_eventsub_state(
+                alert["_id"],
+                online_status=online_status,
+                offline_status=offline_status,
+                error=error
+            )
+            if online_status != "missing" and offline_status != "missing":
+                summary["healthy"] += 1
+            else:
+                summary["missing"] += 1
+
+        return summary
 
     async def _get_eventsub_status_for_broadcaster(self, broadcaster_id: str) -> tuple[dict[str, str], Optional[str]]:
         """Return EventSub subscription status for the given broadcaster."""
@@ -1431,13 +1518,19 @@ class SocialAlerts(commands.Cog):
                     if sub_error:
                         fields.append({"name": "EventSub Status", "value": sub_error, "inline": False})
                     else:
-                        online_status = status_map.get("stream.online", "missing")
-                        offline_status = status_map.get("stream.offline", "missing")
+                        online_status = status_map.get("stream.online", alert.get("eventsub_online_status", "missing"))
+                        offline_status = status_map.get("stream.offline", alert.get("eventsub_offline_status", "missing"))
                         fields.append({
                             "name": "EventSub Subscriptions",
                             "value": f"stream.online: `{online_status}`\nstream.offline: `{offline_status}`",
                             "inline": False
                         })
+                if alert.get("eventsub_last_error"):
+                    fields.append({
+                        "name": "EventSub Last Error",
+                        "value": alert.get("eventsub_last_error"),
+                        "inline": False
+                    })
             else:
                 fields.append({"name": "Channel Lookup", "value": user_error or "Failed", "inline": False})
 
@@ -1494,6 +1587,58 @@ class SocialAlerts(commands.Cog):
             f"**Last Error:** {error}"
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="alert-eventsub-sync", description="Force Twitch EventSub subscription sync (Admin)")
+    @app_commands.describe(username="Optional Twitch username to inspect after syncing")
+    @is_admin()
+    async def alert_eventsub_sync(
+        self,
+        interaction: discord.Interaction,
+        username: Optional[str] = None
+    ):
+        """Force a Twitch EventSub reconciliation and report the result."""
+        await interaction.response.defer(ephemeral=True)
+
+        if not self._eventsub_is_configured():
+            await interaction.followup.send(
+                embed=EmbedFactory.error(
+                    "EventSub Not Configured",
+                    "Set `PUBLIC_BASE_URL` and `TWITCH_EVENTSUB_SECRET` first."
+                ),
+                ephemeral=True
+            )
+            return
+
+        summary = await self._reconcile_twitch_eventsub_subscriptions()
+        description = (
+            f"**Alerts:** {summary['alerts']}\n"
+            f"**Resolved Channels:** {summary['resolved']}\n"
+            f"**Created Subscriptions:** {summary['created']}\n"
+            f"**Deleted Subscriptions:** {summary['deleted']}\n"
+            f"**Healthy Alerts:** {summary['healthy']}\n"
+            f"**Alerts Still Missing Subscriptions:** {summary['missing']}\n"
+            f"**Failures:** {summary['failed']}"
+        )
+
+        if username:
+            alert = await self.db.db.social_alerts.find_one({
+                "guild_id": interaction.guild.id,
+                "platform": "twitch",
+                "username": username.lower()
+            })
+            if alert:
+                description += (
+                    f"\n\n**{username} EventSub Status**\n"
+                    f"stream.online: `{alert.get('eventsub_online_status', 'missing')}`\n"
+                    f"stream.offline: `{alert.get('eventsub_offline_status', 'missing')}`\n"
+                    f"error: {alert.get('eventsub_last_error') or 'None'}"
+                )
+
+        embed_factory = EmbedFactory.success if summary["failed"] == 0 and summary["missing"] == 0 else EmbedFactory.warning
+        await interaction.followup.send(
+            embed=embed_factory("EventSub Sync Complete", description),
+            ephemeral=True
+        )
 
         platform_data = {
             "youtube": {
