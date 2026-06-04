@@ -29,6 +29,13 @@ DEFAULT_ALERT_TEMPLATE = (
 TWITCH_EMBED_COLOR = 0x9146FF
 TWITCH_EVENTSUB_PATH = "/webhooks/twitch/eventsub"
 TWITCH_EVENTSUB_TYPES = ("stream.online", "stream.offline")
+TWITCH_EVENTSUB_RECREATE_STATUSES = {
+    "webhook_callback_verification_failed",
+    "notification_failures_exceeded",
+    "authorization_revoked",
+    "user_removed",
+    "version_removed",
+}
 
 
 class SocialAlertTemplateModal(discord.ui.Modal):
@@ -146,6 +153,14 @@ class SocialAlerts(commands.Cog):
     def _eventsub_is_configured(self) -> bool:
         """Whether this deployment is configured for Twitch EventSub webhooks."""
         return bool(self._get_twitch_eventsub_secret() and self._get_twitch_eventsub_callback_url())
+
+    def _eventsub_status_is_healthy(self, status: str) -> bool:
+        """Whether an EventSub subscription status is fully healthy."""
+        return status == "enabled"
+
+    def _eventsub_status_needs_recreate(self, status: str) -> bool:
+        """Whether an EventSub subscription should be deleted and recreated."""
+        return status in TWITCH_EVENTSUB_RECREATE_STATUSES or status.endswith("_failed")
 
     def verify_eventsub_signature(self, body: bytes, message_id: str, timestamp: str, signature: str) -> bool:
         """Verify Twitch EventSub webhook signatures."""
@@ -736,6 +751,24 @@ class SocialAlerts(commands.Cog):
                 continue
             existing_map[(broadcaster_id, subscription["type"])] = subscription
 
+        for key, subscription in list(existing_map.items()):
+            if key[0] not in desired_broadcasters:
+                continue
+            status = subscription.get("status", "unknown")
+            if self._eventsub_status_needs_recreate(status):
+                ok, error = await self._delete_twitch_eventsub_subscription(subscription["id"])
+                if not ok:
+                    summary["failed"] += 1
+                    logger.warning(
+                        "Failed to delete unhealthy EventSub subscription %s (%s): %s",
+                        subscription["id"],
+                        status,
+                        error
+                    )
+                else:
+                    summary["deleted"] += 1
+                    existing_map.pop(key, None)
+
         for broadcaster_id in desired_broadcasters:
             for event_type in TWITCH_EVENTSUB_TYPES:
                 if (broadcaster_id, event_type) not in existing_map:
@@ -777,8 +810,17 @@ class SocialAlerts(commands.Cog):
             online_status = status_lookup.get((broadcaster_id, "stream.online"), "missing")
             offline_status = status_lookup.get((broadcaster_id, "stream.offline"), "missing")
             error = refreshed_error
-            if not error and ("missing" in (online_status, offline_status)):
-                error = "One or more Twitch EventSub subscriptions are missing."
+            if not error:
+                if "missing" in (online_status, offline_status):
+                    error = "One or more Twitch EventSub subscriptions are missing."
+                elif not (
+                    self._eventsub_status_is_healthy(online_status)
+                    and self._eventsub_status_is_healthy(offline_status)
+                ):
+                    error = (
+                        "One or more Twitch EventSub subscriptions are not fully enabled yet. "
+                        f"online={online_status}, offline={offline_status}"
+                    )
 
             await self._save_eventsub_state(
                 alert["_id"],
@@ -786,7 +828,10 @@ class SocialAlerts(commands.Cog):
                 offline_status=offline_status,
                 error=error
             )
-            if online_status != "missing" and offline_status != "missing":
+            if (
+                self._eventsub_status_is_healthy(online_status)
+                and self._eventsub_status_is_healthy(offline_status)
+            ):
                 summary["healthy"] += 1
             else:
                 summary["missing"] += 1
