@@ -182,8 +182,18 @@ async def start_web_server(bot: Logiq):
 
         app = create_app(bot)
         web_config = bot.config.get('web', {})
-        host = web_config.get('host', '0.0.0.0')
-        port = web_config.get('port', 8000)
+        host = os.getenv('HOST', web_config.get('host', '0.0.0.0'))
+        port_value = os.getenv('PORT')
+        if port_value:
+            try:
+                port = int(port_value)
+            except ValueError:
+                bot.logger.warning(
+                    f"Invalid PORT environment variable '{port_value}', falling back to config port"
+                )
+                port = int(web_config.get('port', 8000))
+        else:
+            port = int(web_config.get('port', 8000))
 
         # Run in background
         config = uvicorn.Config(app, host=host, port=port, log_level="info")
