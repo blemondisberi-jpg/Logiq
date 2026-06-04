@@ -369,6 +369,38 @@ class SocialAlerts(commands.Cog):
         embed.set_footer(text=footer_text)
         return embed
 
+    def _build_twitch_eventsub_embed(self, event: dict, user: dict) -> discord.Embed:
+        """Build a lightweight Twitch embed from EventSub payload data."""
+        login = user.get("login") or event.get("broadcaster_user_login") or ""
+        stream_url = f"https://twitch.tv/{login}" if login else "https://twitch.tv"
+        embed = EmbedFactory.create(
+            title="Live on Twitch",
+            description=f"[Watch now on Twitch]({stream_url})",
+            color=TWITCH_EMBED_COLOR,
+            timestamp=False
+        )
+        embed.set_author(
+            name=user.get("display_name") or event.get("broadcaster_user_name") or login or "Twitch Streamer",
+            url=stream_url
+        )
+
+        profile_image = user.get("profile_image_url")
+        if profile_image:
+            embed.set_thumbnail(url=profile_image)
+
+        embed.add_field(name="Status", value="Going live now", inline=True)
+
+        started_at = event.get("started_at")
+        footer_text = "Twitch"
+        if started_at:
+            try:
+                started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                footer_text = f"Twitch • {started.strftime('%d/%m/%Y, %H:%M')}"
+            except ValueError:
+                pass
+        embed.set_footer(text=footer_text)
+        return embed
+
     async def _get_twitch_access_token(self) -> tuple[Optional[str], Optional[str]]:
         """Get or refresh the Twitch app access token."""
         if self._twitch_access_token and self._twitch_token_expires_at:
@@ -962,9 +994,48 @@ class SocialAlerts(commands.Cog):
                     "display_name": event.get("broadcaster_user_name") or "Unknown"
                 }
 
+            stream_identifier = event.get("id") or f"eventsub:{broadcaster_id}:{event.get('started_at') or ''}"
+            provisional_messages: list[tuple[dict, discord.Message]] = []
+            for alert in alerts:
+                if stream_identifier == alert.get("last_content_id"):
+                    await self._save_alert_check_state(
+                        alert["_id"],
+                        status="already_announced",
+                        error=None,
+                        stream_id=stream_identifier,
+                        stream_started_at=event.get("started_at")
+                    )
+                    continue
+
+                guild = self.bot.get_guild(alert["guild_id"])
+                if not guild:
+                    continue
+                channel = guild.get_channel(alert["channel_id"])
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+
+                message = await self._send_twitch_eventsub_provisional_alert(alert, channel, event, user)
+                if message is None:
+                    await self._save_alert_check_state(
+                        alert["_id"],
+                        status="send_failed",
+                        error="Discord rejected the provisional EventSub alert message."
+                    )
+                    continue
+
+                provisional_messages.append((alert, message))
+                await self._save_alert_check_state(
+                    alert["_id"],
+                    status="sent",
+                    error=None,
+                    stream_id=stream_identifier,
+                    stream_title="Live on Twitch",
+                    stream_started_at=event.get("started_at")
+                )
+
             stream = None
             stream_error = None
-            for attempt in range(8):
+            for attempt in range(12):
                 stream, stream_error = await self._fetch_twitch_stream(broadcaster_id)
                 if stream:
                     if attempt:
@@ -978,49 +1049,53 @@ class SocialAlerts(commands.Cog):
                     break
                 await asyncio.sleep(1)
 
-            if stream_error or not stream:
+            if stream_error:
                 logger.warning(
                     "EventSub received live event but stream fetch failed for broadcaster %s after retries: %s",
                     broadcaster_id,
-                    stream_error or "No stream returned"
+                    stream_error
                 )
                 return
 
-            for alert in alerts:
-                guild = self.bot.get_guild(alert["guild_id"])
-                if not guild:
-                    continue
-                channel = guild.get_channel(alert["channel_id"])
-                if not isinstance(channel, discord.TextChannel):
-                    continue
+            if not stream:
+                return
 
-                if stream["id"] == alert.get("last_content_id"):
-                    await self._save_alert_check_state(
-                        alert["_id"],
-                        status="already_announced",
-                        error=None,
-                        stream_id=stream["id"],
-                        stream_title=stream.get("title"),
-                        stream_started_at=stream.get("started_at")
-                    )
-                    continue
+            rich_embed = self._build_twitch_embed(stream, user)
+            stream_url = f"https://twitch.tv/{user['login']}"
 
-                sent = await self._send_twitch_alert(alert, channel, stream, user)
-                if sent:
-                    await self._save_alert_check_state(
-                        alert["_id"],
-                        status="sent",
-                        error=None,
-                        stream_id=stream["id"],
-                        stream_title=stream.get("title"),
-                        stream_started_at=stream.get("started_at")
+            for alert, message in provisional_messages:
+                context = {
+                    "username": user["login"],
+                    "display_name": user.get("display_name", user["login"]),
+                    "url": stream_url,
+                    "title": stream.get("title") or "Live on Twitch",
+                    "platform": "Twitch",
+                    "viewers": stream.get("viewer_count", 0),
+                    "everyone": "@everyone",
+                    "here": "@here"
+                }
+                rich_content = self._render_alert_message(alert.get("message_template"), context)
+
+                try:
+                    await message.edit(content=rich_content, embed=rich_embed)
+                except discord.Forbidden:
+                    logger.warning("Missing permissions to edit provisional Twitch alert message %s", message.id)
+                except discord.HTTPException as error:
+                    logger.warning(
+                        "Failed to enrich provisional Twitch alert for %s: %s",
+                        alert["username"],
+                        error,
+                        exc_info=True
                     )
-                else:
-                    await self._save_alert_check_state(
-                        alert["_id"],
-                        status="send_failed",
-                        error="Discord rejected the alert message."
-                    )
+
+                await self._save_alert_check_state(
+                    alert["_id"],
+                    status="sent",
+                    error=None,
+                    stream_id=stream["id"],
+                    stream_title=stream.get("title"),
+                    stream_started_at=stream.get("started_at")
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1094,6 +1169,47 @@ class SocialAlerts(commands.Cog):
                     exc_info=True
                 )
                 return False
+
+    async def _send_twitch_eventsub_provisional_alert(
+        self,
+        alert: dict,
+        channel: discord.TextChannel,
+        event: dict,
+        user: dict
+    ) -> Optional[discord.Message]:
+        """Send an immediate provisional Twitch alert from EventSub payload data."""
+        login = user.get("login") or event.get("broadcaster_user_login") or alert["username"]
+        stream_url = f"https://twitch.tv/{login}"
+        context = {
+            "username": login,
+            "display_name": user.get("display_name") or event.get("broadcaster_user_name") or login,
+            "url": stream_url,
+            "title": "Live on Twitch",
+            "platform": "Twitch",
+            "viewers": 0,
+            "everyone": "@everyone",
+            "here": "@here"
+        }
+        content = self._render_alert_message(alert.get("message_template"), context)
+        embed = self._build_twitch_eventsub_embed(event, user)
+
+        try:
+            return await channel.send(
+                content=content,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True)
+            )
+        except discord.Forbidden:
+            logger.warning("Missing permissions to send provisional Twitch alert in channel %s", channel.id)
+            return None
+        except discord.HTTPException as error:
+            logger.error(
+                "Failed to send provisional Twitch alert for %s: %s",
+                alert["username"],
+                error,
+                exc_info=True
+            )
+            return None
 
     async def _check_twitch_alerts_batch(self, alerts: list[dict]) -> None:
         """Check all Twitch alerts using batched Twitch API requests."""
