@@ -5,6 +5,7 @@ Self-assignable roles with modal-based setup
 
 import colorsys
 import re
+import secrets
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -147,9 +148,16 @@ class RoleMenuSetupModal(discord.ui.Modal, title="Create Role Menu"):
 
         # Create view
         if is_exclusive:
-            view = ExclusiveRoleView(role_list, self.title_input.value)
+            view = self.cog._build_role_menu_view(
+                menu_type="exclusive",
+                role_data=role_list,
+                category_name=self.title_input.value
+            )
         else:
-            view = MultiRoleView(role_list)
+            view = self.cog._build_role_menu_view(
+                menu_type="multi",
+                role_data=role_list
+            )
 
         # Send to channel
         message = await self.channel.send(embed=embed, view=view)
@@ -184,9 +192,10 @@ class RoleMenuSetupModal(discord.ui.Modal, title="Create Role Menu"):
 class ExclusiveRoleSelect(discord.ui.Select):
     """Dropdown for exclusive role selection (pick only one)"""
 
-    def __init__(self, role_data: List[dict], category_name: str):
+    def __init__(self, role_data: List[dict], category_name: str, *, cog: 'Roles', token: str):
         self.role_data = role_data
         self.category_name = category_name
+        self.cog = cog
         options = [
             discord.SelectOption(
                 label=r['label'],
@@ -202,7 +211,7 @@ class ExclusiveRoleSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
-            custom_id=f"exclusive_role_{category_name[:50]}"
+            custom_id=f"exclusive_role_{category_name[:40]}_{token}"
         )
         self.role_ids = [r['role'].id for r in role_data]
 
@@ -249,7 +258,12 @@ class ExclusiveRoleSelect(discord.ui.Select):
                 f"You now have the **{selected_role.name}** role!\n\n"
                 f"**Note:** You cannot select another role from this menu."
             )
-            await interaction.message.edit(view=ExclusiveRoleView(self.role_data, self.category_name))
+            await self.cog._refresh_role_menu_message(
+                interaction.message,
+                menu_type="exclusive",
+                role_data=self.role_data,
+                category_name=self.category_name
+            )
             await interaction.followup.send(embed=embed, ephemeral=True)
 
             logger.info(f"{interaction.user} selected exclusive role {selected_role.name}")
@@ -272,8 +286,9 @@ class ExclusiveRoleSelect(discord.ui.Select):
 class MultiRoleSelect(discord.ui.Select):
     """Dropdown menu for multiple role selection"""
 
-    def __init__(self, role_data: List[dict]):
+    def __init__(self, role_data: List[dict], *, cog: 'Roles', token: str):
         self.role_data = role_data
+        self.cog = cog
         options = [
             discord.SelectOption(
                 label=r['label'],
@@ -289,7 +304,7 @@ class MultiRoleSelect(discord.ui.Select):
             min_values=0,
             max_values=len(options),
             options=options,
-            custom_id="multi_role_select"
+            custom_id=f"multi_role_select_{token}"
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -333,7 +348,11 @@ class MultiRoleSelect(discord.ui.Select):
                 "✅ Roles Updated!",
                 "\n".join(changes)
             )
-            await interaction.message.edit(view=MultiRoleView(self.role_data))
+            await self.cog._refresh_role_menu_message(
+                interaction.message,
+                menu_type="multi",
+                role_data=self.role_data
+            )
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except discord.Forbidden:
@@ -354,24 +373,25 @@ class MultiRoleSelect(discord.ui.Select):
 class ExclusiveRoleView(discord.ui.View):
     """View for exclusive role selection"""
 
-    def __init__(self, role_data: List[dict], category_name: str):
+    def __init__(self, role_data: List[dict], category_name: str, *, cog: 'Roles', token: str):
         super().__init__(timeout=None)
-        self.add_item(ExclusiveRoleSelect(role_data, category_name))
+        self.add_item(ExclusiveRoleSelect(role_data, category_name, cog=cog, token=token))
 
 
 class MultiRoleView(discord.ui.View):
     """View for multi role selection"""
 
-    def __init__(self, role_data: List[dict]):
+    def __init__(self, role_data: List[dict], *, cog: 'Roles', token: str):
         super().__init__(timeout=None)
-        self.add_item(MultiRoleSelect(role_data))
+        self.add_item(MultiRoleSelect(role_data, cog=cog, token=token))
 
 
 class ColorRoleSelect(discord.ui.Select):
     """Dropdown for switching between generated colour roles."""
 
-    def __init__(self, role_data: List[dict], all_role_ids: List[int], menu_index: int):
+    def __init__(self, role_data: List[dict], all_role_ids: List[int], menu_index: int, *, cog: 'Roles', token: str):
         self.role_data = role_data
+        self.cog = cog
         options = [
             discord.SelectOption(
                 label=role_info["label"],
@@ -386,7 +406,7 @@ class ColorRoleSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
-            custom_id=f"color_role_select_{menu_index}"
+            custom_id=f"color_role_select_{menu_index}_{token}"
         )
         self.all_role_ids = all_role_ids
 
@@ -430,7 +450,11 @@ class ColorRoleSelect(discord.ui.Select):
                 f"**Added:** {selected_role.name}\n**Removed:** {removed_text}"
             )
             full_role_data = getattr(self.view, "role_data", self.role_data)
-            await interaction.message.edit(view=ColorRolePanelView(full_role_data))
+            await self.cog._refresh_role_menu_message(
+                interaction.message,
+                menu_type="color",
+                role_data=full_role_data
+            )
             await interaction.followup.send(embed=embed, ephemeral=True)
         except discord.Forbidden:
             sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
@@ -450,14 +474,14 @@ class ColorRoleSelect(discord.ui.Select):
 class ColorRolePanelView(discord.ui.View):
     """Multi-dropdown panel for a large prefabricated colour palette."""
 
-    def __init__(self, role_data: List[dict]):
+    def __init__(self, role_data: List[dict], *, cog: 'Roles', token: str):
         super().__init__(timeout=None)
         self.role_data = role_data
         all_role_ids = [role_info["role"].id for role_info in role_data]
         for menu_index, start in enumerate(range(0, len(role_data), COLOR_MENU_SIZE)):
             chunk = role_data[start:start + COLOR_MENU_SIZE]
             if chunk:
-                self.add_item(ColorRoleSelect(chunk, all_role_ids, menu_index))
+                self.add_item(ColorRoleSelect(chunk, all_role_ids, menu_index, cog=cog, token=token))
 
 
 class Roles(commands.Cog):
@@ -470,6 +494,44 @@ class Roles(commands.Cog):
         self.module_config = config.get('modules', {}).get('roles', {})
         # Register persistent views on startup
         self.bot.loop.create_task(self._register_persistent_views())
+
+    def _generate_menu_token(self) -> str:
+        """Generate a short token so a refreshed menu gets a new component identity."""
+        return secrets.token_hex(4)
+
+    def _build_role_menu_view(
+        self,
+        *,
+        menu_type: str,
+        role_data: List[dict],
+        category_name: Optional[str] = None
+    ) -> discord.ui.View:
+        """Build a role menu view with a fresh component token."""
+        token = self._generate_menu_token()
+        if menu_type == "exclusive":
+            return ExclusiveRoleView(role_data, category_name or "role-menu", cog=self, token=token)
+        if menu_type == "multi":
+            return MultiRoleView(role_data, cog=self, token=token)
+        if menu_type == "color":
+            return ColorRolePanelView(role_data, cog=self, token=token)
+        raise ValueError(f"Unsupported role menu type: {menu_type}")
+
+    async def _refresh_role_menu_message(
+        self,
+        message: discord.Message,
+        *,
+        menu_type: str,
+        role_data: List[dict],
+        category_name: Optional[str] = None
+    ) -> None:
+        """Replace a role menu with a fresh view so prior selections don't stay latched."""
+        view = self._build_role_menu_view(
+            menu_type=menu_type,
+            role_data=role_data,
+            category_name=category_name
+        )
+        await message.edit(view=view)
+        self.bot.add_view(view, message_id=message.id)
     
     async def _register_persistent_views(self):
         """Register persistent views for role menus"""
@@ -498,10 +560,7 @@ class Roles(commands.Cog):
                 if not role_data:
                     continue
 
-                if menu_type == "exclusive":
-                    view = ExclusiveRoleView(role_data, menu.get("category_name") or "role-menu")
-                else:
-                    view = MultiRoleView(role_data)
+                category_name = menu.get("category_name") or "role-menu"
             elif menu_type == "color":
                 role_data = []
                 for item in menu.get("roles", []):
@@ -517,12 +576,21 @@ class Roles(commands.Cog):
 
                 if not role_data:
                     continue
-
-                view = ColorRolePanelView(role_data)
             else:
                 continue
 
             try:
+                channel = guild.get_channel(menu.get("channel_id"))
+                if channel is None:
+                    continue
+
+                message = await channel.fetch_message(int(menu["message_id"]))
+                view = self._build_role_menu_view(
+                    menu_type=menu_type,
+                    role_data=role_data,
+                    category_name=menu.get("category_name") or "role-menu"
+                )
+                await message.edit(view=view)
                 self.bot.add_view(view, message_id=int(menu["message_id"]))
                 restored += 1
             except Exception as error:
@@ -626,7 +694,9 @@ class Roles(commands.Cog):
             if not role_data:
                 return False, f"I couldn't find any generated colour roles for prefix `{role_prefix}`."
 
-            self.bot.add_view(ColorRolePanelView(role_data), message_id=message.id)
+            view = self._build_role_menu_view(menu_type="color", role_data=role_data)
+            await message.edit(view=view)
+            self.bot.add_view(view, message_id=message.id)
             await self._store_role_menu(
                 guild_id=guild.id,
                 channel_id=message.channel.id,
@@ -661,8 +731,14 @@ class Roles(commands.Cog):
 
         exclusive_id = next((custom_id for custom_id in custom_ids if custom_id.startswith("exclusive_role_")), None)
         if exclusive_id:
-            category_name = exclusive_id.removeprefix("exclusive_role_") or "role-menu"
-            self.bot.add_view(ExclusiveRoleView(role_data, category_name), message_id=message.id)
+            category_name = exclusive_id.removeprefix("exclusive_role_").rsplit("_", 1)[0] or "role-menu"
+            view = self._build_role_menu_view(
+                menu_type="exclusive",
+                role_data=role_data,
+                category_name=category_name
+            )
+            await message.edit(view=view)
+            self.bot.add_view(view, message_id=message.id)
             await self._store_role_menu(
                 guild_id=guild.id,
                 channel_id=message.channel.id,
@@ -680,8 +756,10 @@ class Roles(commands.Cog):
             )
             return True, f"Repaired exclusive role menu with {len(role_data)} roles."
 
-        if "multi_role_select" in custom_ids:
-            self.bot.add_view(MultiRoleView(role_data), message_id=message.id)
+        if any(custom_id.startswith("multi_role_select_") for custom_id in custom_ids):
+            view = self._build_role_menu_view(menu_type="multi", role_data=role_data)
+            await message.edit(view=view)
+            self.bot.add_view(view, message_id=message.id)
             await self._store_role_menu(
                 guild_id=guild.id,
                 channel_id=message.channel.id,
@@ -971,9 +1049,16 @@ class Roles(commands.Cog):
         
         # Create view
         if is_exclusive:
-            view = ExclusiveRoleView(role_list, title)
+            view = self._build_role_menu_view(
+                menu_type="exclusive",
+                role_data=role_list,
+                category_name=title
+            )
         else:
-            view = MultiRoleView(role_list)
+            view = self._build_role_menu_view(
+                menu_type="multi",
+                role_data=role_list
+            )
         
         # Send to channel
         message = await target_channel.send(embed=embed, view=view)
@@ -1162,7 +1247,7 @@ class Roles(commands.Cog):
             text="If another higher coloured role overrides these, move the generated colour roles higher in your role list."
         )
 
-        view = ColorRolePanelView(role_data)
+        view = self._build_role_menu_view(menu_type="color", role_data=role_data)
         message = await target_channel.send(embed=embed, view=view)
         await self._store_role_menu(
             guild_id=interaction.guild.id,

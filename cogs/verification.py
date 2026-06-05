@@ -607,6 +607,20 @@ class Verification(commands.Cog):
 
         return member.guild.member_count or len(member.guild.members) or 1
 
+    async def _reserve_member_join_position(self, member: discord.Member, guild_config: dict) -> int:
+        """Reserve a monotonic join position so rejoining members get a fresh sequence number."""
+        baseline = await self._get_member_position(member)
+        stored_sequence = int(guild_config.get("welcome_member_sequence", 0) or 0)
+        next_position = baseline if stored_sequence < baseline else stored_sequence + 1
+
+        await self.db.db.guilds.update_one(
+            {"guild_id": member.guild.id},
+            {"$set": {"welcome_member_sequence": next_position}},
+            upsert=True
+        )
+        guild_config["welcome_member_sequence"] = next_position
+        return next_position
+
     def _measure_text(
         self,
         draw: ImageDraw.ImageDraw,
@@ -690,7 +704,13 @@ class Verification(commands.Cog):
             logger.warning("Fetched welcome card background is not a valid image: %s", url)
             return None
 
-    async def _build_welcome_card(self, member: discord.Member, guild_config: dict) -> Optional[discord.File]:
+    async def _build_welcome_card(
+        self,
+        member: discord.Member,
+        guild_config: dict,
+        *,
+        member_position: Optional[int] = None
+    ) -> Optional[discord.File]:
         """Generate a welcome card image for a joining member."""
         width, height = DEFAULT_WELCOME_CARD_SIZE
         accent = self._parse_hex_color(guild_config.get("welcome_card_accent_color"), DEFAULT_WELCOME_CARD_ACCENT)
@@ -741,7 +761,7 @@ class Verification(commands.Cog):
         avatar_y = 96
         canvas.paste(border, (avatar_x, avatar_y), border)
 
-        member_count = await self._get_member_position(member)
+        member_count = member_position if member_position is not None else await self._get_member_position(member)
         context = {
             "user": member.mention,
             "username": member.name,
@@ -865,12 +885,13 @@ class Verification(commands.Cog):
             welcome_message = welcome_message.replace(channel.name, channel.mention)
             welcome_message = welcome_message.replace(f"#{channel.name}", channel.mention)
 
+        member_position = await self._reserve_member_join_position(member, guild_config)
         welcome_context = {
             "user": member.mention,
             "username": member.name,
             "display_name": member.display_name,
             "server": member.guild.name,
-            "member_count": await self._get_member_position(member)
+            "member_count": member_position
         }
 
         # Send welcome message in welcome channel (PUBLIC - everyone can see)
@@ -885,7 +906,11 @@ class Verification(commands.Cog):
                             welcome_context,
                             DEFAULT_WELCOME_CARD_MESSAGE
                         )
-                        welcome_file = await self._build_welcome_card(member, guild_config)
+                        welcome_file = await self._build_welcome_card(
+                            member,
+                            guild_config,
+                            member_position=member_position
+                        )
                         if welcome_file:
                             await welcome_channel.send(content=welcome_content, file=welcome_file)
                         else:
