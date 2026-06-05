@@ -615,6 +615,11 @@ class Verification(commands.Cog):
     async def _reserve_member_join_position(self, member: discord.Member, guild_config: dict) -> int:
         """Reserve a monotonic join position independent from mutable guild config."""
         baseline = await self._get_member_position(member)
+        historical_joins = await self.db.db.analytics.count_documents({
+            "guild_id": member.guild.id,
+            "type": "member_join"
+        })
+        baseline = max(baseline, int(historical_joins or 0))
         floor_value = max(baseline - 1, 0)
         collection = self.db.db[WELCOME_MEMBER_POSITION_COLLECTION]
 
