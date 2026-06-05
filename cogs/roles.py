@@ -217,70 +217,37 @@ class ExclusiveRoleSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         """Handle exclusive role selection - LOCKED after first selection"""
-        try:
-            await interaction.response.defer(ephemeral=True, thinking=False)
+        await self.cog._handle_exclusive_role_assignment(
+            interaction,
+            role_data=self.role_data,
+            category_name=self.category_name,
+            selected_role_id=int(self.values[0])
+        )
 
-            # Check if user already has any role from THIS MENU ONLY
-            user_has_role = False
-            existing_role = None
-            for role_id in self.role_ids:
-                role = interaction.guild.get_role(role_id)
-                if role and role in interaction.user.roles:
-                    user_has_role = True
-                    existing_role = role
-                    break
 
-            if user_has_role:
-                await interaction.followup.send(
-                    embed=EmbedFactory.error(
-                        "🔒 Role Already Selected",
-                        f"You already have **{existing_role.name}**. You cannot select another role from this menu."
-                    ),
-                    ephemeral=True
-                )
-                return
+class ExclusiveRoleButton(discord.ui.Button):
+    """Button fallback for one-option exclusive role menus."""
 
-            selected_role_id = int(self.values[0])
-            selected_role = interaction.guild.get_role(selected_role_id)
+    def __init__(self, role_data: List[dict], category_name: str, *, cog: 'Roles', token: str):
+        self.role_data = role_data
+        self.category_name = category_name
+        self.cog = cog
+        role_info = role_data[0]
+        super().__init__(
+            label=role_info["label"],
+            style=discord.ButtonStyle.primary,
+            emoji=role_info["emoji"],
+            custom_id=f"exclusive_role_button_{role_info['role'].id}_{token}"
+        )
 
-            if not selected_role:
-                await interaction.followup.send(
-                    embed=EmbedFactory.error("Error", "Role not found"),
-                    ephemeral=True
-                )
-                return
-
-            # Give the selected role (only this one, no removing others)
-            await interaction.user.add_roles(selected_role, reason="Exclusive role menu selection")
-
-            embed = EmbedFactory.success(
-                "✅ Role Selected!",
-                f"You now have the **{selected_role.name}** role!\n\n"
-                f"**Note:** You cannot select another role from this menu."
-            )
-            await self.cog._refresh_role_menu_message(
-                interaction.message,
-                menu_type="exclusive",
-                role_data=self.role_data,
-                category_name=self.category_name
-            )
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-            logger.info(f"{interaction.user} selected exclusive role {selected_role.name}")
-
-        except discord.Forbidden:
-            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-            await sender(
-                embed=EmbedFactory.error("Error", "I don't have permission to manage your roles. Please contact an admin."),
-                ephemeral=True
-            )
-        except Exception as e:
-            logger.error(f"Error in role selection: {e}", exc_info=True)
-            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-            await sender(
-                embed=EmbedFactory.error("Error", f"Failed to assign role: {str(e)}"),
-                ephemeral=True
-            )
+    async def callback(self, interaction: discord.Interaction):
+        """Handle one-option exclusive role assignment."""
+        await self.cog._handle_exclusive_role_assignment(
+            interaction,
+            role_data=self.role_data,
+            category_name=self.category_name,
+            selected_role_id=self.role_data[0]["role"].id
+        )
 
 
 class MultiRoleSelect(discord.ui.Select):
@@ -375,7 +342,10 @@ class ExclusiveRoleView(discord.ui.View):
 
     def __init__(self, role_data: List[dict], category_name: str, *, cog: 'Roles', token: str):
         super().__init__(timeout=None)
-        self.add_item(ExclusiveRoleSelect(role_data, category_name, cog=cog, token=token))
+        if len(role_data) == 1:
+            self.add_item(ExclusiveRoleButton(role_data, category_name, cog=cog, token=token))
+        else:
+            self.add_item(ExclusiveRoleSelect(role_data, category_name, cog=cog, token=token))
 
 
 class MultiRoleView(discord.ui.View):
@@ -532,6 +502,72 @@ class Roles(commands.Cog):
         )
         await message.edit(view=view)
         self.bot.add_view(view, message_id=message.id)
+
+    async def _handle_exclusive_role_assignment(
+        self,
+        interaction: discord.Interaction,
+        *,
+        role_data: List[dict],
+        category_name: str,
+        selected_role_id: int
+    ) -> None:
+        """Assign a role from an exclusive menu and refresh the component state."""
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+
+            existing_role = None
+            for role_info in role_data:
+                role = interaction.guild.get_role(role_info["role"].id)
+                if role and role in interaction.user.roles:
+                    existing_role = role
+                    break
+
+            if existing_role:
+                await interaction.followup.send(
+                    embed=EmbedFactory.error(
+                        "🔒 Role Already Selected",
+                        f"You already have **{existing_role.name}**. You cannot select another role from this menu."
+                    ),
+                    ephemeral=True
+                )
+                return
+
+            selected_role = interaction.guild.get_role(selected_role_id)
+            if not selected_role:
+                await interaction.followup.send(
+                    embed=EmbedFactory.error("Error", "Role not found"),
+                    ephemeral=True
+                )
+                return
+
+            await interaction.user.add_roles(selected_role, reason="Exclusive role menu selection")
+
+            embed = EmbedFactory.success(
+                "✅ Role Selected!",
+                f"You now have the **{selected_role.name}** role!\n\n"
+                f"**Note:** You cannot select another role from this menu."
+            )
+            await self._refresh_role_menu_message(
+                interaction.message,
+                menu_type="exclusive",
+                role_data=role_data,
+                category_name=category_name
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info("%s selected exclusive role %s", interaction.user, selected_role.name)
+        except discord.Forbidden:
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
+                embed=EmbedFactory.error("Error", "I don't have permission to manage your roles. Please contact an admin."),
+                ephemeral=True
+            )
+        except Exception as error:
+            logger.error("Error in exclusive role selection: %s", error, exc_info=True)
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
+                embed=EmbedFactory.error("Error", f"Failed to assign role: {error}"),
+                ephemeral=True
+            )
     
     async def _register_persistent_views(self):
         """Register persistent views for role menus"""

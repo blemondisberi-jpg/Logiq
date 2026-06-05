@@ -562,13 +562,16 @@ class Verification(commands.Cog):
         )
         return ImageFont.load_default(), True
 
-    def _normalize_welcome_subtitle(self, subtitle_text: str) -> str:
+    def _normalize_welcome_subtitle(self, subtitle_text: str, context: Optional[dict] = None) -> str:
         """Ensure bare member counts still render as a user-facing position string."""
         stripped = subtitle_text.strip()
         if stripped.isdigit():
             return f"Member #{stripped}"
         if stripped.startswith("#") and stripped[1:].isdigit():
             return f"Member {stripped}"
+        static_member_match = re.fullmatch(r"(?i)member\s*#\s*(\d+)", stripped)
+        if static_member_match and context and "member_count" in context:
+            return f"Member #{context['member_count']}"
         return subtitle_text
 
     def _normalize_welcome_title(self, title_text: str, context: dict) -> str:
@@ -780,7 +783,7 @@ class Verification(commands.Cog):
             context,
             DEFAULT_WELCOME_CARD_SUBTITLE
         )
-        subtitle_text = self._normalize_welcome_subtitle(subtitle_text)
+        subtitle_text = self._normalize_welcome_subtitle(subtitle_text, context)
 
         draw = ImageDraw.Draw(canvas)
         title_size = self._clamp_font_size(
