@@ -15,6 +15,7 @@ from io import BytesIO
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from pymongo import ReturnDocument
 
 from utils.embeds import EmbedFactory, EmbedColor
 from utils.permissions import is_admin
@@ -31,6 +32,7 @@ DEFAULT_WELCOME_CARD_TITLE_SIZE = 74
 DEFAULT_WELCOME_CARD_SUBTITLE_SIZE = 44
 DEFAULT_VERIFICATION_MODE = "button"
 CAPTCHA_CODE_LENGTH = 6
+WELCOME_MEMBER_POSITION_COLLECTION = "welcome_member_positions"
 FONT_SEARCH_DIRS = [
     "/usr/share/fonts/truetype/dejavu",
     "/usr/share/fonts/truetype/liberation",
@@ -611,18 +613,36 @@ class Verification(commands.Cog):
         return member.guild.member_count or len(member.guild.members) or 1
 
     async def _reserve_member_join_position(self, member: discord.Member, guild_config: dict) -> int:
-        """Reserve a monotonic join position so rejoining members get a fresh sequence number."""
+        """Reserve a monotonic join position independent from mutable guild config."""
         baseline = await self._get_member_position(member)
-        stored_sequence = int(guild_config.get("welcome_member_sequence", 0) or 0)
-        next_position = baseline if stored_sequence < baseline else stored_sequence + 1
+        floor_value = max(baseline - 1, 0)
+        collection = self.db.db[WELCOME_MEMBER_POSITION_COLLECTION]
 
-        await self.db.db.guilds.update_one(
+        await collection.update_one(
             {"guild_id": member.guild.id},
-            {"$set": {"welcome_member_sequence": next_position}},
+            {
+                "$setOnInsert": {
+                    "guild_id": member.guild.id,
+                    "sequence": floor_value
+                }
+            },
             upsert=True
         )
-        guild_config["welcome_member_sequence"] = next_position
-        return next_position
+
+        await collection.update_one(
+            {
+                "guild_id": member.guild.id,
+                "sequence": {"$lt": floor_value}
+            },
+            {"$set": {"sequence": floor_value}}
+        )
+
+        counter = await collection.find_one_and_update(
+            {"guild_id": member.guild.id},
+            {"$inc": {"sequence": 1}},
+            return_document=ReturnDocument.AFTER
+        )
+        return int(counter.get("sequence", baseline)) if counter else baseline
 
     def _measure_text(
         self,
