@@ -568,8 +568,12 @@ class Verification(commands.Cog):
         """Ensure bare member counts still render as a user-facing position string."""
         stripped = subtitle_text.strip()
         if stripped.isdigit():
+            if context and "member_count" in context:
+                return f"Member #{context['member_count']}"
             return f"Member #{stripped}"
         if stripped.startswith("#") and stripped[1:].isdigit():
+            if context and "member_count" in context:
+                return f"Member #{context['member_count']}"
             return f"Member {stripped}"
         static_member_match = re.fullmatch(r"(?i)member\s*#\s*(\d+)", stripped)
         if static_member_match and context and "member_count" in context:
@@ -648,6 +652,28 @@ class Verification(commands.Cog):
             return_document=ReturnDocument.AFTER
         )
         return int(counter.get("sequence", baseline)) if counter else baseline
+
+    async def _heal_welcome_card_config(self, guild: discord.Guild, guild_config: dict) -> None:
+        """Repair previously corrupted numeric-only welcome card title/subtitle config."""
+        update_data = {}
+        raw_title = str(guild_config.get("welcome_card_title") or "").strip()
+        raw_subtitle = str(guild_config.get("welcome_card_subtitle") or "").strip()
+
+        if raw_title.isdigit():
+            update_data["welcome_card_title"] = DEFAULT_WELCOME_CARD_TITLE
+            guild_config["welcome_card_title"] = DEFAULT_WELCOME_CARD_TITLE
+
+        if (
+            raw_subtitle.isdigit()
+            or (raw_subtitle.startswith("#") and raw_subtitle[1:].isdigit())
+            or re.fullmatch(r"(?i)member\s*#\s*\d+", raw_subtitle)
+        ):
+            update_data["welcome_card_subtitle"] = DEFAULT_WELCOME_CARD_SUBTITLE
+            guild_config["welcome_card_subtitle"] = DEFAULT_WELCOME_CARD_SUBTITLE
+
+        if update_data:
+            await self.db.update_guild(guild.id, update_data)
+            logger.info("Healed stale welcome card config for guild %s: %s", guild.id, ", ".join(update_data.keys()))
 
     def _measure_text(
         self,
@@ -893,6 +919,7 @@ class Verification(commands.Cog):
         guild_config = await self.db.get_guild(member.guild.id)
         if not guild_config:
             return
+        await self._heal_welcome_card_config(member.guild, guild_config)
 
         verified_role_id = guild_config.get('verified_role')
         verification_type = self._get_verification_mode(guild_config)
@@ -1459,6 +1486,7 @@ class Verification(commands.Cog):
         guild_config = await self.db.get_guild(interaction.guild.id)
         if not guild_config:
             guild_config = await self.db.create_guild(interaction.guild.id)
+        await self._heal_welcome_card_config(interaction.guild, guild_config)
 
         preview_file = await self._build_welcome_card(interaction.user, guild_config)
         if not preview_file:
