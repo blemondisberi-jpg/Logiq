@@ -5,12 +5,15 @@ Creates auto-updating stat/clock voice channels
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -26,6 +29,10 @@ ZONE_TAB_PATH = Path("/usr/share/zoneinfo/zone.tab")
 SERVER_STATS_KEY = "server_stats_channels"
 MAX_COUNTRY_CHOICES = 25
 MAX_TIMEZONE_CHOICES = 25
+CLOCK_UPDATE_INTERVAL_MINUTES = 10
+CLOCK_RETRY_FALLBACK_SECONDS = 600
+DISCORD_API_BASE_URL = "https://discord.com/api/v10"
+DISCORD_USER_AGENT = "LogiqServerStats/1.0"
 
 COUNTRY_ALIASES = {
     "usa": "US",
@@ -74,6 +81,11 @@ def _next_refresh_time() -> datetime:
     return (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
 
 
+def _clock_update_due(now: datetime) -> bool:
+    """Whether the current UTC minute is one we should use for a clock update."""
+    return now.minute % CLOCK_UPDATE_INTERVAL_MINUTES == 0
+
+
 class ServerStatsChannels(commands.Cog):
     """Auto-updating stat channels including a country clock."""
 
@@ -84,6 +96,7 @@ class ServerStatsChannels(commands.Cog):
         self.country_names_by_code: dict[str, str] = {}
         self.country_timezones_by_code: dict[str, list[str]] = {}
         self.lookup_to_code: dict[str, str] = {}
+        self.sync_lock = asyncio.Lock()
         self._load_timezone_tables()
         self.update_task = self.bot.loop.create_task(self._update_loop())
 
@@ -192,6 +205,23 @@ class ServerStatsChannels(commands.Cog):
                     return choices
         return choices
 
+    def _format_clock_channel_name(self, *, timezone_name: str, clock_label: str) -> str:
+        """Build the current clock channel name."""
+        now = datetime.now(ZoneInfo(timezone_name))
+        return f"🕒 {clock_label}: {now.strftime('%H:%M')}"
+
+    def _format_stat_channel_names(self, guild: discord.Guild) -> dict[str, str]:
+        """Build the non-clock stat channel names."""
+        total_members = guild.member_count or len(guild.members)
+        bots = sum(1 for member in guild.members if member.bot)
+        humans = total_members - bots
+
+        return {
+            "total": f"🔒 Total Members: {total_members}",
+            "humans": f"🔒 People: {humans}",
+            "bots": f"🔒 Robots: {bots}",
+        }
+
     def _format_channel_names(
         self,
         guild: discord.Guild,
@@ -199,18 +229,59 @@ class ServerStatsChannels(commands.Cog):
         timezone_name: str,
         clock_label: str
     ) -> dict[str, str]:
-        """Build the desired stat channel names."""
-        now = datetime.now(ZoneInfo(timezone_name))
-        total_members = guild.member_count or len(guild.members)
-        bots = sum(1 for member in guild.members if member.bot)
-        humans = total_members - bots
-
+        """Build all desired stat channel names."""
         return {
-            "clock": f"🕒 {clock_label}: {now.strftime('%H:%M')}",
-            "total": f"🔒 Total Members: {total_members}",
-            "humans": f"🔒 People: {humans}",
-            "bots": f"🔒 Robots: {bots}",
+            "clock": self._format_clock_channel_name(timezone_name=timezone_name, clock_label=clock_label),
+            **self._format_stat_channel_names(guild),
         }
+
+    async def _rename_channel_via_api(
+        self,
+        channel_id: int,
+        desired_name: str,
+        *,
+        reason: str
+    ) -> dict[str, object]:
+        """Rename a channel directly through Discord's HTTP API without long internal sleeps."""
+        token = getattr(self.bot.http, "token", None)
+        if not token:
+            raise RuntimeError("Bot HTTP token is unavailable.")
+
+        headers = {
+            "Authorization": f"Bot {token}",
+            "User-Agent": DISCORD_USER_AGENT,
+            "Content-Type": "application/json",
+            "X-Audit-Log-Reason": quote(reason, safe=""),
+        }
+        payload = {"name": desired_name}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.patch(
+                f"{DISCORD_API_BASE_URL}/channels/{channel_id}",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status in {200, 201}:
+                    data = await response.json()
+                    return {"status": "updated", "name": data.get("name")}
+
+                if response.status == 429:
+                    body = await response.json()
+                    retry_after = float(body.get("retry_after") or CLOCK_RETRY_FALLBACK_SECONDS)
+                    return {"status": "rate_limited", "retry_after": retry_after}
+
+                if response.status == 404:
+                    return {"status": "missing"}
+
+                body = await response.text()
+                logger.error(
+                    "Unexpected Discord response while renaming channel %s: %s %s",
+                    channel_id,
+                    response.status,
+                    body,
+                )
+                return {"status": "error", "http_status": response.status, "body": body}
 
     async def _update_config(self, guild_id: int, payload: dict) -> None:
         """Persist server stats config into the guild document."""
@@ -286,21 +357,91 @@ class ServerStatsChannels(commands.Cog):
             "timezone_name": timezone_name,
             "clock_label": clock_label,
             "category_name": category_name,
+            "clock_rate_limited_until": existing_config.get("clock_rate_limited_until") if existing_config else None,
         }
 
-    async def _sync_one_guild(self, guild: discord.Guild, config: dict) -> None:
+    async def _sync_one_guild(
+        self,
+        guild: discord.Guild,
+        config: dict,
+        *,
+        manual_refresh: bool = False
+    ) -> dict[str, object]:
         """Update one guild's stat channels to current values."""
         if not config.get("enabled"):
-            return
+            return {"status": "disabled"}
 
         channel_ids = config.get("channel_ids", {})
         timezone_name = config.get("timezone_name")
         clock_label = config.get("clock_label", "Time")
         if not timezone_name:
-            return
+            return {"status": "missing_timezone"}
 
-        desired_names = self._format_channel_names(guild, timezone_name=timezone_name, clock_label=clock_label)
+        desired_names = self._format_stat_channel_names(guild)
         repair_required = False
+        config_changed = False
+        clock_result = "unchanged"
+        now_utc = discord.utils.utcnow()
+
+        clock_channel = guild.get_channel(channel_ids.get("clock"))
+        if clock_channel is None:
+            repair_required = True
+            logger.warning(
+                "Server stats clock channel missing from cache for guild %s. Marking config for repair.",
+                guild.id,
+            )
+        else:
+            rate_limited_until_raw = config.get("clock_rate_limited_until")
+            rate_limited_until = None
+            if rate_limited_until_raw:
+                try:
+                    rate_limited_until = datetime.fromtimestamp(float(rate_limited_until_raw), tz=now_utc.tzinfo)
+                except (TypeError, ValueError, OSError):
+                    rate_limited_until = None
+
+            should_attempt_clock = manual_refresh or _clock_update_due(now_utc)
+            if should_attempt_clock:
+                if rate_limited_until and now_utc < rate_limited_until:
+                    clock_result = f"rate_limited_until_{rate_limited_until.strftime('%H:%M:%S')}"
+                else:
+                    desired_clock_name = self._format_clock_channel_name(
+                        timezone_name=timezone_name,
+                        clock_label=clock_label
+                    )
+                    if clock_channel.name != desired_clock_name:
+                        rename_result = await self._rename_channel_via_api(
+                            clock_channel.id,
+                            desired_clock_name,
+                            reason="Refreshing server stats clock channel",
+                        )
+                        status = rename_result.get("status")
+                        if status == "updated":
+                            clock_result = "updated"
+                            if config.get("clock_rate_limited_until") is not None:
+                                config["clock_rate_limited_until"] = None
+                                config_changed = True
+                        elif status == "rate_limited":
+                            retry_after = float(rename_result.get("retry_after") or CLOCK_RETRY_FALLBACK_SECONDS)
+                            rate_limit_deadline = discord.utils.utcnow() + timedelta(seconds=retry_after)
+                            config["clock_rate_limited_until"] = rate_limit_deadline.timestamp()
+                            config_changed = True
+                            clock_result = f"rate_limited_{int(retry_after)}s"
+                            logger.warning(
+                                "Server stats clock rename hit Discord channel maintenance throttling for guild %s. "
+                                "Next attempt after %s.",
+                                guild.id,
+                                rate_limit_deadline.isoformat(),
+                            )
+                        elif status == "missing":
+                            repair_required = True
+                            clock_result = "missing"
+                        else:
+                            clock_result = "error"
+                    else:
+                        clock_result = "already_current"
+            else:
+                clock_result = "not_due"
+
         for key, desired_name in desired_names.items():
             channel = guild.get_channel(channel_ids.get(key))
             if channel is None:
@@ -342,24 +483,38 @@ class ServerStatsChannels(commands.Cog):
             repaired_config["country_name"] = config.get("country_name")
             await self._update_config(guild.id, repaired_config)
             logger.info("Repaired server stats channels for guild %s", guild.id)
+            return {
+                "status": "repaired",
+                "clock_result": clock_result,
+            }
+
+        if config_changed:
+            await self._update_config(guild.id, config)
+            logger.info("Updated server stats clock throttle state for guild %s", guild.id)
+
+        return {
+            "status": "ok",
+            "clock_result": clock_result,
+        }
 
     async def _update_loop(self) -> None:
         """Background loop to refresh all configured stat channels."""
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
             try:
-                guild_configs = await self.db.db.guilds.find({f"{SERVER_STATS_KEY}.enabled": True}).to_list(length=1000)
-                for guild_config in guild_configs:
-                    guild = self.bot.get_guild(guild_config["guild_id"])
-                    if guild is None:
-                        continue
-                    stats_config = guild_config.get(SERVER_STATS_KEY)
-                    if not stats_config:
-                        continue
-                    try:
-                        await self._sync_one_guild(guild, stats_config)
-                    except Exception as error:
-                        logger.error("Failed to update server stats channels for %s: %s", guild.id, error, exc_info=True)
+                async with self.sync_lock:
+                    guild_configs = await self.db.db.guilds.find({f"{SERVER_STATS_KEY}.enabled": True}).to_list(length=1000)
+                    for guild_config in guild_configs:
+                        guild = self.bot.get_guild(guild_config["guild_id"])
+                        if guild is None:
+                            continue
+                        stats_config = guild_config.get(SERVER_STATS_KEY)
+                        if not stats_config:
+                            continue
+                        try:
+                            await self._sync_one_guild(guild, stats_config)
+                        except Exception as error:
+                            logger.error("Failed to update server stats channels for %s: %s", guild.id, error, exc_info=True)
                 await discord.utils.sleep_until(_next_refresh_time())
             except Exception as error:
                 logger.error("Server stats update loop failed: %s", error, exc_info=True)
@@ -466,7 +621,7 @@ class ServerStatsChannels(commands.Cog):
                 f"**Country:** {country_name}\n"
                 f"**Timezone:** {selected_timezone}\n"
                 f"**Category:** <#{stats_config['category_id']}>\n\n"
-                "The clock and member counters will refresh automatically."
+                "Member counters refresh automatically, and the clock channel updates on a Discord-safe cadence."
             )
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -485,9 +640,33 @@ class ServerStatsChannels(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True)
-        await self._sync_one_guild(interaction.guild, stats_config)
+        async with self.sync_lock:
+            result = await self._sync_one_guild(interaction.guild, stats_config, manual_refresh=True)
+        clock_result = result.get("clock_result", "unknown")
+        message = "Server stats channels were updated successfully."
+        if isinstance(clock_result, str) and clock_result.startswith("rate_limited_until_"):
+            next_time = clock_result.replace("rate_limited_until_", "", 1)
+            message = (
+                "Member counts were refreshed, but Discord is temporarily throttling clock-channel renames.\n\n"
+                f"Next allowed clock update: **{next_time} UTC**"
+            )
+        elif clock_result == "updated":
+            message = "Server stats channels were updated successfully, including the clock channel."
+        elif clock_result == "already_current":
+            message = "Server stats channels were checked and the clock was already current."
+        elif clock_result == "not_due":
+            message = (
+                "Member counts were checked successfully.\n\n"
+                f"The clock channel updates automatically every **{CLOCK_UPDATE_INTERVAL_MINUTES} minutes** "
+                "to stay within Discord's channel-maintenance limits."
+            )
+        elif isinstance(clock_result, str) and clock_result.startswith("rate_limited_"):
+            message = (
+                "Member counts were refreshed, but Discord is temporarily throttling clock-channel renames.\n\n"
+                "The bot will retry automatically after the cooldown expires."
+            )
         await interaction.followup.send(
-            embed=EmbedFactory.success("Refreshed", "Server stats channels were updated successfully."),
+            embed=EmbedFactory.success("Refreshed", message),
             ephemeral=True
         )
 
