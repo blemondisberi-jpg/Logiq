@@ -300,12 +300,48 @@ class ServerStatsChannels(commands.Cog):
             return
 
         desired_names = self._format_channel_names(guild, timezone_name=timezone_name, clock_label=clock_label)
+        repair_required = False
         for key, desired_name in desired_names.items():
             channel = guild.get_channel(channel_ids.get(key))
             if channel is None:
+                repair_required = True
+                logger.warning(
+                    "Server stats channel missing from cache for guild %s (%s). Marking config for repair.",
+                    guild.id,
+                    key,
+                )
                 continue
             if channel.name != desired_name:
-                await channel.edit(name=desired_name, reason="Refreshing server stats channels")
+                try:
+                    await channel.edit(name=desired_name, reason="Refreshing server stats channels")
+                except discord.NotFound:
+                    repair_required = True
+                    logger.warning(
+                        "Server stats channel %s for guild %s no longer exists. Rebuilding stats channels.",
+                        channel.id,
+                        guild.id,
+                    )
+                except discord.HTTPException as error:
+                    logger.error(
+                        "Failed to update server stats channel %s for guild %s: %s",
+                        channel.id,
+                        guild.id,
+                        error,
+                        exc_info=True,
+                    )
+
+        if repair_required:
+            repaired_config = await self._create_or_sync_channels(
+                guild,
+                category_name=config.get("category_name") or "📊 SERVER STATS 📊",
+                clock_label=clock_label,
+                timezone_name=timezone_name,
+                existing_config=config,
+            )
+            repaired_config["country_code"] = config.get("country_code")
+            repaired_config["country_name"] = config.get("country_name")
+            await self._update_config(guild.id, repaired_config)
+            logger.info("Repaired server stats channels for guild %s", guild.id)
 
     async def _update_loop(self) -> None:
         """Background loop to refresh all configured stat channels."""
