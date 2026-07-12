@@ -3,7 +3,6 @@ Roles Cog for Logiq
 Self-assignable roles with modal-based setup
 """
 
-import colorsys
 import re
 import secrets
 import discord
@@ -17,26 +16,53 @@ from utils.permissions import is_admin, PermissionChecker
 from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
-MAX_COLOR_PANEL_OPTIONS = 125
+MAX_COLOR_PANEL_OPTIONS = 25
 COLOR_MENU_SIZE = 25
 ROLE_MENU_COLLECTION = "role_menus"
+NAMED_COLOR_PALETTE = [
+    ("Crimson", "#D12E2E"),
+    ("Ember", "#D14D24"),
+    ("Tangerine", "#D1721B"),
+    ("Amber", "#D19B11"),
+    ("Solar", "#D1C908"),
+    ("Chartreuse", "#B6D82F"),
+    ("Lime", "#8AD825"),
+    ("Apple", "#58D81C"),
+    ("Neon Green", "#22D812"),
+    ("Jade", "#08D829"),
+    ("Mint", "#31E077"),
+    ("Seafoam", "#27E09D"),
+    ("Turquoise", "#1DE0C8"),
+    ("Cyan", "#13C7E0"),
+    ("Azure", "#0892E0"),
+    ("Cornflower", "#337BE8"),
+    ("Royal Blue", "#2847E8"),
+    ("Indigo", "#2E1EE8"),
+    ("Violet", "#5713E8"),
+    ("Purple", "#8609E8"),
+    ("Orchid", "#CA34EF"),
+    ("Fuchsia", "#EF29E7"),
+    ("Hot Pink", "#EF1FB5"),
+    ("Rose", "#EF147D"),
+    ("Cherry", "#EF0940"),
+]
+
+
+def _hex_to_rgb(hex_value: str) -> tuple[int, int, int]:
+    """Convert a hex colour string into an RGB tuple."""
+    value = hex_value.lstrip("#")
+    return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
 
 
 def build_prefab_color_palette(count: int = MAX_COLOR_PANEL_OPTIONS) -> List[dict]:
-    """Build a wide prefab color palette up to Discord's dropdown limit."""
+    """Build a compact palette of punchy prefabricated colours."""
     palette = []
-    for index in range(count):
-        hue = index / count
-        saturation = 0.55 + (0.25 * ((index % 5) / 4))
-        value = 0.72 + (0.18 * (((index // 5) % 5) / 4))
-        red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
-        rgb = (int(red * 255), int(green * 255), int(blue * 255))
-        hex_value = "#{:02X}{:02X}{:02X}".format(*rgb)
+    for label, hex_value in NAMED_COLOR_PALETTE[:count]:
         palette.append({
-            "name": f"Color {index + 1:03d}",
-            "label": f"Color {index + 1:03d}",
+            "name": label,
+            "label": label,
             "hex": hex_value,
-            "rgb": rgb
+            "rgb": _hex_to_rgb(hex_value)
         })
     return palette
 
@@ -365,7 +391,7 @@ class ColorRoleSelect(discord.ui.Select):
         options = [
             discord.SelectOption(
                 label=role_info["label"],
-                description=role_info["hex"],
+                description=f"Switch to {role_info['label']}",
                 value=str(role_info["role"].id)
             )
             for role_info in role_data[:COLOR_MENU_SIZE]
@@ -684,7 +710,10 @@ class Roles(commands.Cog):
 
     def _build_color_role_regex(self, role_prefix: str) -> re.Pattern:
         """Return the generated colour-role naming pattern for a prefix."""
-        return re.compile(rf"^{re.escape(role_prefix)} Color \d{{3}} #[0-9A-F]{{6}}$")
+        labels = [re.escape(role_info["label"]) for role_info in build_prefab_color_palette()]
+        named_pattern = "|".join(labels)
+        legacy_pattern = r"Color \d{3} #[0-9A-F]{6}"
+        return re.compile(rf"^{re.escape(role_prefix)} (?:{named_pattern}|{legacy_pattern})$")
 
     async def _repair_role_menu_message(
         self,
@@ -718,9 +747,12 @@ class Roles(commands.Cog):
             for role in sorted(guild.roles, key=lambda item: item.name):
                 if pattern.match(role.name):
                     hex_match = re.search(r"(#[0-9A-F]{6})$", role.name)
+                    label = role.name.removeprefix(f"{role_prefix} ").strip()
+                    if hex_match and label.endswith(hex_match.group(1)):
+                        label = label[: -len(hex_match.group(1))].strip()
                     role_data.append({
                         "role": role,
-                        "label": role.name.split(" ")[1] + " " + role.name.split(" ")[2] if len(role.name.split(" ")) >= 3 else role.name,
+                        "label": label or role.name,
                         "hex": hex_match.group(1) if hex_match else "#{:02X}{:02X}{:02X}".format(
                             role.colour.r, role.colour.g, role.colour.b
                         ),
@@ -841,8 +873,9 @@ class Roles(commands.Cog):
         role_data = []
 
         for entry in palette:
-            role_name = f"{role_prefix} {entry['label']} {entry['hex']}"
-            existing_role = discord.utils.get(guild.roles, name=role_name)
+            role_name = f"{role_prefix} {entry['label']}"
+            legacy_role_name = f"{role_prefix} {entry['label']} {entry['hex']}"
+            existing_role = discord.utils.get(guild.roles, name=role_name) or discord.utils.get(guild.roles, name=legacy_role_name)
             role = existing_role
 
             if role is None:
@@ -868,15 +901,34 @@ class Roles(commands.Cog):
         *,
         mode: str,
         skip_bots: bool,
-        confirm: bool
+        confirm: bool,
+        include_role: Optional[discord.Role] = None,
+        exclude_role: Optional[discord.Role] = None
     ):
         """Add or remove a role for many members with safety checks."""
+        if include_role and exclude_role and include_role.id == exclude_role.id:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Conflicting Filters",
+                    "The include-role and exclude-role filters cannot be the same role."
+                ),
+                ephemeral=True
+            )
+            return
+
         if not confirm:
             action = "add" if mode == "add" else "remove"
+            scope = "all eligible members"
+            if include_role and exclude_role:
+                scope = f"members with {include_role.mention} excluding {exclude_role.mention}"
+            elif include_role:
+                scope = f"members with {include_role.mention}"
+            elif exclude_role:
+                scope = f"members without {exclude_role.mention}"
             await interaction.response.send_message(
                 embed=EmbedFactory.warning(
                     "Confirmation Required",
-                    f"This command affects many members. Re-run it with `confirm:true` to {action} {role.mention} {'to' if mode == 'add' else 'from'} all eligible members."
+                    f"This command affects many members. Re-run it with `confirm:true` to {action} {role.mention} {'to' if mode == 'add' else 'from'} {scope}."
                 ),
                 ephemeral=True
             )
@@ -922,6 +974,7 @@ class Roles(commands.Cog):
             "already": 0,
             "missing": 0,
             "skipped_bots": 0,
+            "filtered_out": 0,
             "skipped_hierarchy": 0,
             "failed": 0
         }
@@ -930,6 +983,14 @@ class Roles(commands.Cog):
         for member in interaction.guild.members:
             if member.bot and skip_bots:
                 stats["skipped_bots"] += 1
+                continue
+
+            if include_role and include_role not in member.roles:
+                stats["filtered_out"] += 1
+                continue
+
+            if exclude_role and exclude_role in member.roles:
+                stats["filtered_out"] += 1
                 continue
 
             if not PermissionChecker.check_hierarchy(bot_member, member):
@@ -965,6 +1026,9 @@ class Roles(commands.Cog):
                 {"name": "Role", "value": role.mention, "inline": True},
                 {"name": "Action", "value": verb, "inline": True},
                 {"name": "Changed", "value": str(stats["changed"]), "inline": True},
+                {"name": "Include Filter", "value": include_role.mention if include_role else "None", "inline": True},
+                {"name": "Exclude Filter", "value": exclude_role.mention if exclude_role else "None", "inline": True},
+                {"name": "Filtered Out", "value": str(stats["filtered_out"]), "inline": True},
                 {"name": "Already Had Role", "value": str(stats["already"]), "inline": True},
                 {"name": "Didn't Have Role", "value": str(stats["missing"]), "inline": True},
                 {"name": "Skipped Bots", "value": str(stats["skipped_bots"]), "inline": True},
@@ -980,6 +1044,35 @@ class Roles(commands.Cog):
             role,
             interaction.guild,
             stats
+        )
+
+    @app_commands.command(name="massrole-add-filter", description="Add a role to a filtered member group (Admin)")
+    @app_commands.describe(
+        role="Role to add",
+        include_role="Only target members who already have this role",
+        exclude_role="Skip members who already have this role",
+        skip_bots="Skip bot accounts (recommended)",
+        confirm="Must be true to actually run"
+    )
+    @is_admin()
+    async def massrole_add_filter(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        include_role: Optional[discord.Role] = None,
+        exclude_role: Optional[discord.Role] = None,
+        skip_bots: bool = True,
+        confirm: bool = False
+    ):
+        """Add a role to members matching the chosen filters."""
+        await self._mass_role_update(
+            interaction,
+            role,
+            mode="add",
+            skip_bots=skip_bots,
+            confirm=confirm,
+            include_role=include_role,
+            exclude_role=exclude_role
         )
 
     @app_commands.command(name="create-role-menu", description="Create a role menu (Admin)")
@@ -1216,7 +1309,36 @@ class Roles(commands.Cog):
             confirm=confirm
         )
 
-    @app_commands.command(name="create-color-panel", description="Create a prefabricated multi-dropdown colour role panel (Admin)")
+    @app_commands.command(name="massrole-remove-filter", description="Remove a role from a filtered member group (Admin)")
+    @app_commands.describe(
+        role="Role to remove",
+        include_role="Only target members who already have this role",
+        exclude_role="Skip members who already have this role",
+        skip_bots="Skip bot accounts (recommended)",
+        confirm="Must be true to actually run"
+    )
+    @is_admin()
+    async def massrole_remove_filter(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        include_role: Optional[discord.Role] = None,
+        exclude_role: Optional[discord.Role] = None,
+        skip_bots: bool = True,
+        confirm: bool = False
+    ):
+        """Remove a role from members matching the chosen filters."""
+        await self._mass_role_update(
+            interaction,
+            role,
+            mode="remove",
+            skip_bots=skip_bots,
+            confirm=confirm,
+            include_role=include_role,
+            exclude_role=exclude_role
+        )
+
+    @app_commands.command(name="create-color-panel", description="Create a prefabricated 25-colour role panel (Admin)")
     @app_commands.describe(
         channel="Channel to send the colour panel to",
         title="Panel title",
@@ -1229,10 +1351,10 @@ class Roles(commands.Cog):
         interaction: discord.Interaction,
         channel: Optional[discord.TextChannel] = None,
         title: str = "Choose Your Colour",
-        description: str = "Pick one colour role from the dropdowns below. You can switch colours any time.",
+        description: str = "Pick one colour role from the dropdown below. You can switch colours any time.",
         role_prefix: str = "Color"
     ):
-        """Create a prefabricated colour role panel up to Discord's hard dropdown limit."""
+        """Create a prefabricated colour role panel with a focused 25-colour palette."""
         target_channel = channel or interaction.channel
         bot_member = self._get_bot_member(interaction.guild)
         if bot_member is None:
@@ -1273,7 +1395,7 @@ class Roles(commands.Cog):
             title=title,
             description=(
                 f"{description}\n\n"
-                f"**Palette Size:** {len(role_data)} colours across {len(role_data) // COLOR_MENU_SIZE} dropdowns\n"
+                f"**Palette Size:** {len(role_data)} colours across {max(1, len(role_data) // COLOR_MENU_SIZE)} dropdown\n"
                 f"**Role Prefix:** {role_prefix.strip() or 'Color'}\n\n"
                 "Each member can hold one generated colour role at a time."
             ),

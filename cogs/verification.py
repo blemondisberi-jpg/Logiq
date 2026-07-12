@@ -7,12 +7,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from pathlib import Path
+from datetime import timedelta
+from urllib.parse import urlparse
 import random
 import re
 import string
 from typing import Optional
 import logging
 from io import BytesIO
+import os
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
@@ -34,6 +37,17 @@ DEFAULT_WELCOME_CARD_SUBTITLE_SIZE = 44
 DEFAULT_VERIFICATION_MODE = "button"
 CAPTCHA_CODE_LENGTH = 6
 WELCOME_MEMBER_POSITION_COLLECTION = "welcome_member_positions"
+VERIFICATION_PLATFORM_CHOICES = ("twitch", "youtube", "kick")
+VERIFICATION_PLATFORM_LABELS = {
+    "twitch": "Twitch",
+    "youtube": "YouTube",
+    "kick": "Kick",
+}
+VERIFICATION_PLATFORM_EMOJIS = {
+    "twitch": "🟣",
+    "youtube": "🔴",
+    "kick": "🟢",
+}
 FONT_SEARCH_DIRS = [
     "/usr/share/fonts/truetype/dejavu",
     "/usr/share/fonts/truetype/liberation",
@@ -188,6 +202,91 @@ class CaptchaEntryView(discord.ui.View):
         await interaction.response.send_modal(modal)
 
 
+class PlatformLinkModal(discord.ui.Modal):
+    """Modal for submitting a streaming platform username or profile URL."""
+
+    def __init__(self, cog: 'Verification', *, platform: str, guild_id: int, user_id: int):
+        self.cog = cog
+        self.platform = platform
+        self.guild_id = guild_id
+        self.user_id = user_id
+        platform_label = VERIFICATION_PLATFORM_LABELS[platform]
+        super().__init__(title=f"Link {platform_label} Profile")
+        self.profile_input = discord.ui.TextInput(
+            label=f"{platform_label} username, handle, or URL",
+            placeholder=self._placeholder_for(platform),
+            required=True,
+            max_length=200
+        )
+        self.add_item(self.profile_input)
+
+    def _placeholder_for(self, platform: str) -> str:
+        if platform == "twitch":
+            return "e.g. blamevita or https://twitch.tv/blamevita"
+        if platform == "youtube":
+            return "e.g. @GoogleDevelopers or https://youtube.com/@GoogleDevelopers"
+        return "e.g. xqc or https://kick.com/xqc"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Validate and complete the selected platform link."""
+        if interaction.user.id != self.user_id:
+            await self.cog._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Not For You", "This platform-link prompt belongs to another member."),
+                ephemeral=True
+            )
+            return
+
+        await self.cog.complete_platform_link(
+            interaction,
+            platform=self.platform,
+            raw_value=str(self.profile_input.value),
+            guild_id=self.guild_id
+        )
+
+
+class PlatformLinkView(discord.ui.View):
+    """Prompt a member to choose which streaming platform they use."""
+
+    def __init__(self, cog: 'Verification', *, guild_id: int, user_id: int):
+        super().__init__(timeout=1800)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Restrict the prompt to the intended member."""
+        if interaction.user.id != self.user_id:
+            await self.cog._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Not For You", "This platform-link prompt belongs to another member."),
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def _open_platform_modal(self, interaction: discord.Interaction, platform: str) -> None:
+        modal = PlatformLinkModal(
+            self.cog,
+            platform=platform,
+            guild_id=self.guild_id,
+            user_id=self.user_id
+        )
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Twitch", style=discord.ButtonStyle.secondary, emoji="🟣")
+    async def twitch_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_platform_modal(interaction, "twitch")
+
+    @discord.ui.button(label="YouTube", style=discord.ButtonStyle.secondary, emoji="🔴")
+    async def youtube_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_platform_modal(interaction, "youtube")
+
+    @discord.ui.button(label="Kick", style=discord.ButtonStyle.secondary, emoji="🟢")
+    async def kick_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_platform_modal(interaction, "kick")
+
+
 class Verification(commands.Cog):
     """Verification system cog"""
 
@@ -259,6 +358,393 @@ class Verification(commands.Cog):
     def get_rules_accept_view(self, guild_config: dict) -> RulesAcceptView:
         """Create a rules acceptance view using the saved button label."""
         return RulesAcceptView(self, button_label=self._get_rules_button_label(guild_config))
+
+    def _platform_link_enabled(self, guild_config: Optional[dict]) -> bool:
+        """Whether the optional platform-link verification stage is enabled."""
+        if not guild_config:
+            return False
+        return bool(guild_config.get("platform_link_enabled", False))
+
+    def _get_platform_role_id(self, guild_config: dict, platform: str) -> Optional[int]:
+        """Get the configured role ID for a platform."""
+        role_map = guild_config.get("platform_link_roles", {}) or {}
+        role_id = role_map.get(platform)
+        return int(role_id) if role_id else None
+
+    def _get_youtube_api_key(self) -> Optional[str]:
+        """Load the YouTube Data API key."""
+        return os.getenv("YOUTUBE_API_KEY") or self.config.get("api_keys", {}).get("youtube")
+
+    def _get_kick_credentials(self) -> tuple[Optional[str], Optional[str]]:
+        """Load Kick API credentials from environment or config."""
+        client_id = os.getenv("KICK_CLIENT_ID") or self.config.get("api_keys", {}).get("kick_client_id")
+        client_secret = os.getenv("KICK_CLIENT_SECRET") or self.config.get("api_keys", {}).get("kick_client_secret")
+        return client_id, client_secret
+
+    async def _get_kick_access_token(self) -> tuple[Optional[str], Optional[str]]:
+        """Get or refresh the Kick app access token."""
+        token = getattr(self, "_kick_access_token", None)
+        expires_at = getattr(self, "_kick_token_expires_at", None)
+        if token and expires_at and discord.utils.utcnow() < expires_at:
+            return token, None
+
+        client_id, client_secret = self._get_kick_credentials()
+        if not client_id or not client_secret:
+            return None, "KICK_CLIENT_ID or KICK_CLIENT_SECRET is missing."
+
+        session = await self.get_session()
+        payload = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials"
+        }
+
+        try:
+            async with session.post("https://id.kick.com/oauth/token", data=payload) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to get Kick access token: %s %s", response.status, body)
+                    return None, f"Kick token request failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Failed to contact Kick for access token: %s", error, exc_info=True)
+            return None, "Could not contact Kick while requesting an access token."
+
+        access_token = data.get("access_token")
+        if not access_token:
+            logger.error("Kick token response was missing access_token: %s", data)
+            return None, "Kick did not return an access token."
+
+        expires_in = max(int(data.get("expires_in", 0)) - 60, 60)
+        self._kick_access_token = access_token
+        self._kick_token_expires_at = discord.utils.utcnow() + timedelta(seconds=expires_in)
+        return access_token, None
+
+    def _normalize_twitch_username(self, value: str) -> str:
+        """Normalize a Twitch username or URL to a login name."""
+        candidate = value.strip()
+        if "twitch.tv" in candidate.lower():
+            parsed = urlparse(candidate)
+            candidate = parsed.path.strip("/").split("/")[0] if parsed.path else ""
+        return candidate.strip().lstrip("@").lower()
+
+    def _parse_youtube_input(self, value: str) -> tuple[str, str]:
+        """Normalize YouTube input into a lookup type and value."""
+        candidate = value.strip()
+        if "youtube.com" in candidate.lower() or "youtu.be" in candidate.lower():
+            parsed = urlparse(candidate)
+            path = parsed.path.strip("/")
+            if path.startswith("@"):
+                return "handle", path
+            parts = path.split("/")
+            if len(parts) >= 2 and parts[0] == "channel":
+                return "id", parts[1]
+            if len(parts) >= 2 and parts[0] == "user":
+                return "username", parts[1]
+        if candidate.startswith("@"):
+            return "handle", candidate
+        if candidate.startswith("UC") and len(candidate) >= 20:
+            return "id", candidate
+        return "handle", candidate
+
+    def _normalize_kick_slug(self, value: str) -> str:
+        """Normalize a Kick username or URL to a channel slug."""
+        candidate = value.strip()
+        if "kick.com" in candidate.lower():
+            parsed = urlparse(candidate)
+            candidate = parsed.path.strip("/").split("/")[0] if parsed.path else ""
+        return candidate.strip().lstrip("@").lower()
+
+    async def _resolve_twitch_profile(self, raw_value: str) -> tuple[Optional[dict], Optional[str]]:
+        """Verify a Twitch profile exists and return normalized data."""
+        username = self._normalize_twitch_username(raw_value)
+        if not username:
+            return None, "Please provide a valid Twitch username or profile URL."
+
+        social_alerts = self.bot.get_cog("SocialAlerts")
+        if social_alerts and hasattr(social_alerts, "_fetch_twitch_user"):
+            user, error = await social_alerts._fetch_twitch_user(username)  # type: ignore[attr-defined]
+        else:
+            return None, "The Twitch lookup service is unavailable right now."
+
+        if error or not user:
+            return None, error or f"No Twitch channel found for `{username}`."
+
+        login = user.get("login") or username
+        return {
+            "platform": "twitch",
+            "username": login,
+            "display_name": user.get("display_name") or login,
+            "profile_url": f"https://twitch.tv/{login}",
+            "profile_image_url": user.get("profile_image_url")
+        }, None
+
+    async def _resolve_youtube_profile(self, raw_value: str) -> tuple[Optional[dict], Optional[str]]:
+        """Verify a YouTube profile exists and return normalized data."""
+        api_key = self._get_youtube_api_key()
+        if not api_key:
+            return None, "YOUTUBE_API_KEY is missing."
+
+        lookup_type, lookup_value = self._parse_youtube_input(raw_value)
+        if not lookup_value:
+            return None, "Please provide a valid YouTube handle, channel ID, or profile URL."
+
+        params = {"part": "snippet", "key": api_key}
+        if lookup_type == "handle":
+            params["forHandle"] = lookup_value
+        elif lookup_type == "username":
+            params["forUsername"] = lookup_value
+        else:
+            params["id"] = lookup_value
+
+        session = await self.get_session()
+        try:
+            async with session.get("https://www.googleapis.com/youtube/v3/channels", params=params) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to fetch YouTube channel %s: %s %s", lookup_value, response.status, body)
+                    return None, f"YouTube channel lookup failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching YouTube channel %s: %s", lookup_value, error, exc_info=True)
+            return None, "Could not contact YouTube while looking up the channel."
+
+        items = data.get("items", [])
+        if not items and lookup_type == "handle":
+            fallback_params = {"part": "snippet", "key": api_key, "forUsername": lookup_value.lstrip("@")}
+            try:
+                async with session.get("https://www.googleapis.com/youtube/v3/channels", params=fallback_params) as response:
+                    if response.status == 200:
+                        fallback_data = await response.json()
+                        items = fallback_data.get("items", [])
+            except aiohttp.ClientError:
+                items = []
+
+        if not items:
+            return None, (
+                "No YouTube channel found for that value. Please use a channel handle like `@YourName`, "
+                "a channel ID, or a direct channel URL."
+            )
+
+        channel = items[0]
+        snippet = channel.get("snippet", {})
+        custom_url = snippet.get("customUrl") or lookup_value
+        normalized_username = custom_url.lstrip("@")
+        profile_url = (
+            f"https://youtube.com/{custom_url}"
+            if str(custom_url).startswith("@")
+            else f"https://youtube.com/channel/{channel.get('id')}"
+        )
+        return {
+            "platform": "youtube",
+            "username": normalized_username,
+            "display_name": normalized_username or snippet.get("title") or channel.get("id"),
+            "profile_url": profile_url,
+            "profile_image_url": ((snippet.get("thumbnails") or {}).get("default") or {}).get("url")
+        }, None
+
+    async def _resolve_kick_profile(self, raw_value: str) -> tuple[Optional[dict], Optional[str]]:
+        """Verify a Kick profile exists and return normalized data."""
+        slug = self._normalize_kick_slug(raw_value)
+        if not slug:
+            return None, "Please provide a valid Kick username or channel URL."
+
+        token, token_error = await self._get_kick_access_token()
+        if not token:
+            return None, token_error or "Kick credentials are unavailable."
+
+        session = await self.get_session()
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            async with session.get("https://api.kick.com/public/v1/channels", params=[("slug", slug)], headers=headers) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to fetch Kick channel %s: %s %s", slug, response.status, body)
+                    return None, f"Kick channel lookup failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching Kick channel %s: %s", slug, error, exc_info=True)
+            return None, "Could not contact Kick while looking up the channel."
+
+        channels = data.get("data", [])
+        if not channels:
+            return None, f"No Kick channel found for `{slug}`."
+
+        channel = channels[0]
+        resolved_slug = channel.get("slug") or slug
+        return {
+            "platform": "kick",
+            "username": resolved_slug,
+            "display_name": resolved_slug,
+            "profile_url": f"https://kick.com/{resolved_slug}",
+            "profile_image_url": channel.get("banner_picture")
+        }, None
+
+    async def _resolve_platform_profile(self, platform: str, raw_value: str) -> tuple[Optional[dict], Optional[str]]:
+        """Verify the selected platform profile exists."""
+        if platform == "twitch":
+            return await self._resolve_twitch_profile(raw_value)
+        if platform == "youtube":
+            return await self._resolve_youtube_profile(raw_value)
+        if platform == "kick":
+            return await self._resolve_kick_profile(raw_value)
+        return None, "Unsupported platform."
+
+    async def _ensure_user_record(self, user_id: int, guild_id: int) -> dict:
+        """Fetch or create the per-guild user document."""
+        user_data = await self.db.get_user(user_id, guild_id)
+        if not user_data:
+            user_data = await self.db.create_user(user_id, guild_id)
+        return user_data
+
+    async def _save_platform_identity(self, user_id: int, guild_id: int, profile_data: dict) -> None:
+        """Persist the member's selected viewing platform identity."""
+        await self._ensure_user_record(user_id, guild_id)
+        await self.db.update_user(
+            user_id,
+            guild_id,
+            {
+                "viewer_platform": profile_data["platform"],
+                "viewer_platform_username": profile_data["username"],
+                "viewer_platform_display_name": profile_data["display_name"],
+                "viewer_platform_url": profile_data["profile_url"],
+                "viewer_platform_profile_image_url": profile_data.get("profile_image_url")
+            }
+        )
+
+    def _get_saved_platform_identity(self, user_data: Optional[dict]) -> Optional[dict]:
+        """Return a saved platform identity if present."""
+        if not user_data:
+            return None
+        platform = user_data.get("viewer_platform")
+        username = user_data.get("viewer_platform_username")
+        if platform not in VERIFICATION_PLATFORM_CHOICES or not username:
+            return None
+        return {
+            "platform": platform,
+            "username": username,
+            "display_name": user_data.get("viewer_platform_display_name") or username,
+            "profile_url": user_data.get("viewer_platform_url") or "",
+            "profile_image_url": user_data.get("viewer_platform_profile_image_url")
+        }
+
+    async def _update_member_nickname(self, member: discord.Member, nickname: str) -> tuple[bool, Optional[str]]:
+        """Attempt to update a member's nickname to match their platform username."""
+        nickname = nickname.strip()
+        if not nickname:
+            return False, "No nickname was provided."
+
+        if not member.guild.me.guild_permissions.manage_nicknames:
+            return False, "I don't have the **Manage Nicknames** permission."
+
+        if member.guild.owner_id == member.id:
+            return False, "I can't change the server owner's nickname."
+
+        if member.guild.me.top_role <= member.top_role:
+            return False, "My top role is not high enough to change that nickname."
+
+        safe_nickname = nickname[:32]
+        try:
+            await member.edit(nick=safe_nickname, reason="Verification platform identity sync")
+            return True, None
+        except discord.Forbidden:
+            return False, "Discord denied the nickname change because of role hierarchy."
+        except discord.HTTPException as error:
+            return False, f"Discord rejected the nickname change: {error}"
+
+    async def _start_platform_link_prompt(
+        self,
+        interaction: discord.Interaction,
+        *,
+        guild: discord.Guild,
+        member: discord.Member,
+        guild_config: dict,
+        redo: bool = False
+    ) -> None:
+        """Prompt a member to choose and submit their primary viewing platform."""
+        missing_roles = [
+            VERIFICATION_PLATFORM_LABELS[platform]
+            for platform in VERIFICATION_PLATFORM_CHOICES
+            if not self._get_platform_role_id(guild_config, platform)
+        ]
+        if missing_roles:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error(
+                    "Platform Verification Not Ready",
+                    "An admin still needs to configure roles for: " + ", ".join(missing_roles)
+                ),
+                ephemeral=True
+            )
+            return
+
+        description = (
+            "Choose the streaming platform you primarily watch from, then submit your profile username or URL.\n\n"
+            "Once it checks out, I'll assign your platform role, sync your nickname, and finish your verification."
+        )
+        if redo:
+            description = (
+                "Choose your current main viewing platform and submit your updated profile username or URL.\n\n"
+                "I'll swap your platform role and update your server nickname."
+            )
+
+        embed = EmbedFactory.create(
+            title="🎯 Link Your Viewing Platform",
+            description=description,
+            color=EmbedColor.PRIMARY
+        )
+        view = PlatformLinkView(self, guild_id=guild.id, user_id=member.id)
+        response_kwargs = {"embed": embed, "view": view}
+        if interaction.guild is not None:
+            response_kwargs["ephemeral"] = True
+
+        if interaction.response.is_done():
+            await interaction.followup.send(**response_kwargs)
+        else:
+            await interaction.response.send_message(**response_kwargs)
+
+    async def _apply_platform_verification(
+        self,
+        member: discord.Member,
+        guild_config: dict,
+        *,
+        profile_data: dict
+    ) -> tuple[bool, list[str], list[str], Optional[str]]:
+        """Apply platform role, remove old platform roles, add verified role, and sync nickname."""
+        guild = member.guild
+        verified_role_id = guild_config.get("verified_role")
+        verified_role = guild.get_role(verified_role_id) if verified_role_id else None
+        if verified_role is None:
+            return False, [], [], "Verified role is not configured correctly."
+
+        platform = profile_data["platform"]
+        target_role_id = self._get_platform_role_id(guild_config, platform)
+        target_role = guild.get_role(target_role_id) if target_role_id else None
+        if target_role is None:
+            return False, [], [], f"The configured {VERIFICATION_PLATFORM_LABELS[platform]} role no longer exists."
+
+        platform_roles = []
+        for platform_name in VERIFICATION_PLATFORM_CHOICES:
+            role_id = self._get_platform_role_id(guild_config, platform_name)
+            role = guild.get_role(role_id) if role_id else None
+            if role:
+                platform_roles.append(role)
+
+        roles_to_remove = [role for role in platform_roles if role != target_role and role in member.roles]
+        roles_to_add = [role for role in {target_role, verified_role} if role and role not in member.roles]
+
+        try:
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason="Verification platform refresh")
+            if roles_to_add:
+                await member.add_roles(*roles_to_add, reason="Verification platform assignment")
+        except discord.Forbidden:
+            return False, roles_to_add, roles_to_remove, "I don't have permission to manage one or more required roles."
+        except discord.HTTPException as error:
+            return False, roles_to_add, roles_to_remove, f"Discord rejected the role update: {error}"
+
+        nickname_updated, nickname_error = await self._update_member_nickname(member, profile_data["display_name"])
+        return True, roles_to_add, roles_to_remove, None if nickname_updated else nickname_error
 
     async def save_rules_panel_config(
         self,
@@ -1154,6 +1640,54 @@ class Verification(commands.Cog):
             )
             return
 
+        if source in {"rules_accept", "rules_accept_captcha"} and self._platform_link_enabled(guild_config):
+            user_data = await self._ensure_user_record(member.id, guild.id)
+            saved_profile = self._get_saved_platform_identity(user_data)
+            if saved_profile:
+                success, roles_added, roles_removed, nickname_note = await self._apply_platform_verification(
+                    member,
+                    guild_config,
+                    profile_data=saved_profile
+                )
+                if not success:
+                    await self._send_interaction_embed(
+                        interaction,
+                        embed=EmbedFactory.error(
+                            "Verification Error",
+                            nickname_note or "I couldn't finish your platform-based verification."
+                        ),
+                        ephemeral=True
+                    )
+                    return
+
+                message = (
+                    f"You've accepted the rules for **{guild.name}**.\n\n"
+                    "I restored your saved platform identity and verified you automatically."
+                )
+                if nickname_note:
+                    message += f"\n\n**Nickname Note:** {nickname_note}"
+
+                await self._send_interaction_embed(
+                    interaction,
+                    embed=EmbedFactory.success("✅ Rules Accepted!", message),
+                    ephemeral=True
+                )
+                logger.info(
+                    "Verified user %s in %s via saved platform identity (%s)",
+                    member,
+                    guild,
+                    saved_profile["platform"]
+                )
+                return
+
+            await self._start_platform_link_prompt(
+                interaction,
+                guild=guild,
+                member=member,
+                guild_config=guild_config
+            )
+            return
+
         try:
             # Silently add verified role
             await member.add_roles(verified_role)
@@ -1196,6 +1730,85 @@ class Verification(commands.Cog):
                 embed=EmbedFactory.error("Error", "An error occurred during verification"),
                 ephemeral=True
             )
+
+    async def complete_platform_link(
+        self,
+        interaction: discord.Interaction,
+        *,
+        platform: str,
+        raw_value: str,
+        guild_id: Optional[int] = None
+    ) -> None:
+        """Validate a selected streaming profile, then complete platform-based verification."""
+        guild, member, guild_config = await self._resolve_verification_context(interaction, guild_id)
+        if guild is None or member is None or guild_config is None:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Verification Error", "I couldn't load this server's verification context."),
+                ephemeral=True
+            )
+            return
+
+        if platform not in VERIFICATION_PLATFORM_CHOICES:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Unsupported Platform", "Please choose Twitch, YouTube, or Kick."),
+                ephemeral=True
+            )
+            return
+
+        profile_data, error = await self._resolve_platform_profile(platform, raw_value)
+        if error or not profile_data:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error(
+                    f"{VERIFICATION_PLATFORM_LABELS[platform]} Lookup Failed",
+                    error or "I couldn't verify that profile."
+                ),
+                ephemeral=True
+            )
+            return
+
+        success, roles_added, roles_removed, nickname_note = await self._apply_platform_verification(
+            member,
+            guild_config,
+            profile_data=profile_data
+        )
+        if not success:
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Verification Error", nickname_note or "I couldn't apply your platform verification settings."),
+                ephemeral=True
+            )
+            return
+
+        await self._save_platform_identity(member.id, guild.id, profile_data)
+
+        added_names = ", ".join(role.name for role in roles_added) if roles_added else "No new roles were needed"
+        removed_names = ", ".join(role.name for role in roles_removed) if roles_removed else "None"
+        message = (
+            f"**Platform:** {VERIFICATION_PLATFORM_LABELS[platform]}\n"
+            f"**Profile:** [{profile_data['display_name']}]({profile_data['profile_url']})\n"
+            f"**Roles Added:** {added_names}\n"
+            f"**Roles Removed:** {removed_names}"
+        )
+        if nickname_note:
+            message += f"\n**Nickname Note:** {nickname_note}"
+        else:
+            message += f"\n**Nickname:** Updated to `{profile_data['display_name'][:32]}`"
+
+        await self._send_interaction_embed(
+            interaction,
+            embed=EmbedFactory.success("✅ Verification Complete!", message),
+            ephemeral=True
+        )
+        logger.info(
+            "Completed platform verification for %s in %s via %s (%s)",
+            member,
+            guild,
+            platform,
+            profile_data["username"]
+        )
 
     @app_commands.command(name="verification-role", description="Set the role granted after verification or rules acceptance (Admin)")
     @app_commands.describe(role="Role to assign when a member completes verification")
@@ -1261,7 +1874,17 @@ class Verification(commands.Cog):
                 {"name": "Type", "value": guild_config.get("verification_type", DEFAULT_VERIFICATION_MODE), "inline": True},
                 {"name": "Rules Accept Flow", "value": self._get_verification_mode(guild_config), "inline": True},
                 {"name": "Rules Panel", "value": "Enabled" if guild_config.get("rules_panel_enabled", False) else "Disabled", "inline": True},
+                {"name": "Platform Link Stage", "value": "Enabled" if self._platform_link_enabled(guild_config) else "Disabled", "inline": True},
                 {"name": "Verified Role", "value": verified_role.mention if verified_role else "Missing role", "inline": False},
+                {
+                    "name": "Platform Roles",
+                    "value": (
+                        f"Twitch: {interaction.guild.get_role(self._get_platform_role_id(guild_config, 'twitch')).mention if self._get_platform_role_id(guild_config, 'twitch') and interaction.guild.get_role(self._get_platform_role_id(guild_config, 'twitch')) else 'Not set'}\n"
+                        f"YouTube: {interaction.guild.get_role(self._get_platform_role_id(guild_config, 'youtube')).mention if self._get_platform_role_id(guild_config, 'youtube') and interaction.guild.get_role(self._get_platform_role_id(guild_config, 'youtube')) else 'Not set'}\n"
+                        f"Kick: {interaction.guild.get_role(self._get_platform_role_id(guild_config, 'kick')).mention if self._get_platform_role_id(guild_config, 'kick') and interaction.guild.get_role(self._get_platform_role_id(guild_config, 'kick')) else 'Not set'}"
+                    ),
+                    "inline": False
+                },
                 {"name": "Welcome Channel", "value": welcome_channel.mention if welcome_channel else "Not set", "inline": False},
                 {"name": "Verify Channel", "value": verify_channel.mention if verify_channel else "DM only / not set", "inline": False},
                 {
@@ -1292,6 +1915,100 @@ class Verification(commands.Cog):
             ]
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="verification-platform-role", description="Set the role granted for a viewing platform (Admin)")
+    @app_commands.describe(
+        platform="Streaming platform to configure",
+        role="Role members should receive for that platform"
+    )
+    @app_commands.choices(
+        platform=[
+            app_commands.Choice(name="Twitch", value="twitch"),
+            app_commands.Choice(name="YouTube", value="youtube"),
+            app_commands.Choice(name="Kick", value="kick")
+        ]
+    )
+    @is_admin()
+    async def verification_platform_role(
+        self,
+        interaction: discord.Interaction,
+        platform: str,
+        role: discord.Role
+    ):
+        """Set the role assigned when a member links a specific viewing platform."""
+        if role.is_default():
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Invalid Role", "Please choose a normal server role, not `@everyone`."),
+                ephemeral=True
+            )
+            return
+
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(interaction.guild.id)
+
+        role_map = guild_config.get("platform_link_roles", {}) or {}
+        role_map[platform] = role.id
+        await self.db.update_guild(interaction.guild.id, {"platform_link_roles": role_map})
+
+        await interaction.response.send_message(
+            embed=EmbedFactory.success(
+                "Platform Role Updated",
+                f"Members who link **{VERIFICATION_PLATFORM_LABELS[platform]}** will now receive {role.mention}."
+            ),
+            ephemeral=True
+        )
+
+    @app_commands.command(name="verification-platform-toggle", description="Enable or disable required platform-link verification (Admin)")
+    @app_commands.describe(enabled="Whether members must link Twitch, YouTube, or Kick after accepting the rules")
+    @is_admin()
+    async def verification_platform_toggle(self, interaction: discord.Interaction, enabled: bool):
+        """Toggle the optional second-stage platform link flow."""
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(interaction.guild.id)
+
+        if enabled:
+            missing_roles = [
+                VERIFICATION_PLATFORM_LABELS[platform]
+                for platform in VERIFICATION_PLATFORM_CHOICES
+                if not self._get_platform_role_id(guild_config, platform)
+            ]
+            missing_credentials = []
+            if not (os.getenv("TWITCH_CLIENT_ID") or self.config.get("api_keys", {}).get("twitch_client_id")) or not (os.getenv("TWITCH_CLIENT_SECRET") or self.config.get("api_keys", {}).get("twitch_client_secret")):
+                missing_credentials.append("Twitch credentials")
+            if not self._get_youtube_api_key():
+                missing_credentials.append("YouTube API key")
+            if not all(self._get_kick_credentials()):
+                missing_credentials.append("Kick credentials")
+
+            if missing_roles or missing_credentials:
+                problems = []
+                if missing_roles:
+                    problems.append("Missing platform roles: " + ", ".join(missing_roles))
+                if missing_credentials:
+                    problems.append("Missing credentials: " + ", ".join(missing_credentials))
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error(
+                        "Platform Verification Not Ready",
+                        "\n".join(problems)
+                    ),
+                    ephemeral=True
+                )
+                return
+
+        await self.db.update_guild(interaction.guild.id, {"platform_link_enabled": enabled})
+        await interaction.response.send_message(
+            embed=EmbedFactory.success(
+                "Platform Verification Updated",
+                (
+                    "Members must now link their Twitch, YouTube, or Kick profile after accepting the rules before they receive the verified role."
+                    if enabled
+                    else "The extra platform-link stage is now disabled. Rules acceptance will behave as before."
+                )
+            ),
+            ephemeral=True
+        )
 
     @app_commands.command(name="verification-mode", description="Choose what happens after members click Accept (Admin)")
     @app_commands.describe(mode="Use 'button' for instant access or 'captcha' to send a DM captcha after Accept")
@@ -1324,6 +2041,37 @@ class Verification(commands.Cog):
         await interaction.response.send_message(
             embed=EmbedFactory.success("Verification Mode Updated", description),
             ephemeral=True
+        )
+
+    @app_commands.command(name="verification-platform-link", description="Link or update your main viewing platform")
+    async def verification_platform_link(self, interaction: discord.Interaction):
+        """Let a member redo or complete their platform-link verification."""
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.error("Server Only", "This command can only be used inside the server."),
+                ephemeral=True
+            )
+            return
+
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config or not self._platform_link_enabled(guild_config):
+            await self._send_interaction_embed(
+                interaction,
+                embed=EmbedFactory.info(
+                    "Platform Link Disabled",
+                    "This server does not currently require platform-link verification."
+                ),
+                ephemeral=True
+            )
+            return
+
+        await self._start_platform_link_prompt(
+            interaction,
+            guild=interaction.guild,
+            member=interaction.user,
+            guild_config=guild_config,
+            redo=True
         )
 
     @app_commands.command(name="verification-disable", description="Disable server verification (Admin)")
