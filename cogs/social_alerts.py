@@ -101,6 +101,11 @@ class SocialAlertTemplateModal(discord.ui.Modal):
 class SocialAlerts(commands.Cog):
     """Social media alerts cog"""
 
+    alert_group = app_commands.Group(
+        name="alert",
+        description="Manage social media alerts"
+    )
+
     def __init__(self, bot: commands.Bot, db: DatabaseManager, config: dict):
         self.bot = bot
         self.db = db
@@ -1512,7 +1517,7 @@ class SocialAlerts(commands.Cog):
         elif platform == "twitter":
             await self.check_twitter(alert)
 
-    @app_commands.command(name="alert-add", description="Add social media alert (Admin)")
+    @alert_group.command(name="add", description="Add social media alert (Admin)")
     @app_commands.describe(
         platform="Platform (twitch/youtube/twitter)",
         username="Username or channel ID",
@@ -1561,7 +1566,7 @@ class SocialAlerts(commands.Cog):
                 ephemeral=True
             )
 
-    @app_commands.command(name="alert-edit", description="Edit an existing social media alert (Admin)")
+    @alert_group.command(name="edit", description="Edit an existing social media alert (Admin)")
     @app_commands.describe(
         platform="Platform (twitch/youtube/twitter)",
         username="Username or channel ID",
@@ -1616,7 +1621,7 @@ class SocialAlerts(commands.Cog):
                 ephemeral=True
             )
 
-    @app_commands.command(name="alert-remove", description="Remove social media alert (Admin)")
+    @alert_group.command(name="remove", description="Remove social media alert (Admin)")
     @app_commands.describe(
         platform="Platform (twitch/youtube/twitter)",
         username="Username or channel ID"
@@ -1659,7 +1664,7 @@ class SocialAlerts(commands.Cog):
             await self._reconcile_twitch_eventsub_subscriptions()
         logger.info("%s removed %s alert for %s", interaction.user, platform, username)
 
-    @app_commands.command(name="alert-list", description="List all social media alerts (Admin)")
+    @alert_group.command(name="list", description="List all social media alerts (Admin)")
     @is_admin()
     async def list_alerts(self, interaction: discord.Interaction):
         """List all social media alerts (ADMIN ONLY)"""
@@ -1705,7 +1710,7 @@ class SocialAlerts(commands.Cog):
 
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="alert-test", description="Test social media alert (Admin)")
+    @alert_group.command(name="test", description="Test social media alert (Admin)")
     @app_commands.describe(
         platform="Platform (twitch/youtube/twitter)",
         username="Username to test"
@@ -1791,7 +1796,7 @@ class SocialAlerts(commands.Cog):
             )
             return
 
-    @app_commands.command(name="alert-debug", description="Diagnose a social media alert (Admin)")
+    @alert_group.command(name="debug", description="Diagnose a social media alert (Admin)")
     @app_commands.describe(
         platform="Platform (twitch/youtube/twitter)",
         username="Username to diagnose"
@@ -1910,7 +1915,7 @@ class SocialAlerts(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="alert-run", description="Run a social media alert check immediately (Admin)")
+    @alert_group.command(name="run", description="Run a social media alert check immediately (Admin)")
     @app_commands.describe(
         platform="Platform (twitch/youtube/twitter)",
         username="Username to check now"
@@ -1957,7 +1962,7 @@ class SocialAlerts(commands.Cog):
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="alert-eventsub-sync", description="Force Twitch EventSub subscription sync (Admin)")
+    @alert_group.command(name="eventsub-sync", description="Force Twitch EventSub subscription sync (Admin)")
     @app_commands.describe(username="Optional Twitch username to inspect after syncing")
     @is_admin()
     async def alert_eventsub_sync(

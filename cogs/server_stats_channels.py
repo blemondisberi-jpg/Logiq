@@ -89,6 +89,11 @@ def _clock_update_due(now: datetime) -> bool:
 class ServerStatsChannels(commands.Cog):
     """Auto-updating stat channels including a country clock."""
 
+    serverstats_channels_group = app_commands.Group(
+        name="serverstats-channels",
+        description="Manage auto-updating server stat channels"
+    )
+
     def __init__(self, bot: commands.Bot, db: DatabaseManager, config: dict):
         self.bot = bot
         self.db = db
@@ -520,7 +525,7 @@ class ServerStatsChannels(commands.Cog):
                 logger.error("Server stats update loop failed: %s", error, exc_info=True)
                 await discord.utils.sleep_until(_next_refresh_time())
 
-    @app_commands.command(name="serverstats-channels-setup", description="Create auto-updating server stat channels (Admin)")
+    @serverstats_channels_group.command(name="setup", description="Create auto-updating server stat channels (Admin)")
     @app_commands.describe(
         country="Country whose time should be displayed",
         timezone_name="Optional IANA timezone if the country has multiple timezones",
@@ -626,7 +631,7 @@ class ServerStatsChannels(commands.Cog):
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="serverstats-channels-refresh", description="Refresh the server stat channels now (Admin)")
+    @serverstats_channels_group.command(name="refresh", description="Refresh the server stat channels now (Admin)")
     @app_commands.guild_only()
     @is_admin()
     async def serverstats_channels_refresh(self, interaction: discord.Interaction):
@@ -670,7 +675,7 @@ class ServerStatsChannels(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(name="serverstats-channels-remove", description="Disable the server stat channels (Admin)")
+    @serverstats_channels_group.command(name="remove", description="Disable the server stat channels (Admin)")
     @app_commands.describe(delete_channels="Delete the created category and channels too")
     @app_commands.guild_only()
     @is_admin()
