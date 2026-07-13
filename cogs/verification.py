@@ -751,13 +751,15 @@ class Verification(commands.Cog):
         guild_id: int,
         *,
         channel_id: int,
+        message_id: Optional[int] = None,
         panel_message: Optional[str],
         title: str,
         description: str,
         color: str,
         image_url: Optional[str],
         footer: Optional[str],
-        button_label: str
+        button_label: str,
+        enabled: bool = True
     ) -> dict:
         """Persist rules-panel verification settings for a guild."""
         guild_config = await self.db.get_guild(guild_id)
@@ -766,8 +768,9 @@ class Verification(commands.Cog):
 
         update_data = {
             "verification_enabled": True,
-            "rules_panel_enabled": True,
+            "rules_panel_enabled": enabled,
             "rules_channel": channel_id,
+            "rules_message_id": message_id,
             "rules_panel_message": panel_message,
             "rules_title": title,
             "rules_description": description,

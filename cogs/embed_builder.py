@@ -43,26 +43,33 @@ class RulesEmbedModal(discord.ui.Modal):
         color: str,
         verification: bool,
         title: Optional[str],
-        button_label: str = "Accept"
+        button_label: str = "Accept",
+        edit_message: Optional[discord.Message] = None,
+        defaults: Optional[dict] = None,
+        persist_rules_config: bool = False
     ):
-        super().__init__(title="Create Rules Panel")
+        super().__init__(title="Edit Rules Panel" if edit_message else "Create Rules Panel")
         self.cog = cog
         self.channel = channel
         self.color = color
         self.verification = verification
         self.button_label = button_label
+        self.edit_message = edit_message
+        self.persist_rules_config = persist_rules_config
+        defaults = defaults or {}
 
         self.panel_message = discord.ui.TextInput(
             label="Message Above The Embed",
             placeholder="Optional text above the embed. Discord markdown works here.",
             style=discord.TextStyle.paragraph,
             required=False,
+            default=defaults.get("content"),
             max_length=2000
         )
         self.embed_title = discord.ui.TextInput(
             label="Embed Title",
             placeholder="Server Rules",
-            default=title or "Server Rules",
+            default=defaults.get("title") or title or "Server Rules",
             required=True,
             max_length=256
         )
@@ -71,18 +78,21 @@ class RulesEmbedModal(discord.ui.Modal):
             placeholder="Write your rules here. Line breaks and markdown are preserved.",
             style=discord.TextStyle.paragraph,
             required=True,
+            default=defaults.get("description"),
             max_length=4000
         )
         self.image_url = discord.ui.TextInput(
             label="Embed Image URL",
             placeholder="Optional image URL for the bottom of the embed",
             required=False,
+            default=defaults.get("image_url"),
             max_length=1000
         )
         self.footer = discord.ui.TextInput(
             label="Footer Text",
             placeholder="Optional footer text",
             required=False,
+            default=defaults.get("footer"),
             max_length=2048
         )
 
@@ -102,10 +112,97 @@ class RulesEmbedModal(discord.ui.Modal):
             color=self.color,
             verification=self.verification,
             button_label=self.button_label,
+            edit_message=self.edit_message,
+            persist_rules_config=self.persist_rules_config,
             panel_message=self.panel_message.value.strip() or None,
             title=self.embed_title.value.strip() or "Server Rules",
             rules_text=self.rules_text.value,
             image_url=self.image_url.value.strip() or None,
+            footer=self.footer.value.strip() or None
+        )
+
+
+class EmbedEditModal(discord.ui.Modal):
+    """Modal for editing an existing bot-authored embed."""
+
+    def __init__(
+        self,
+        cog: "EmbedBuilder",
+        *,
+        message: discord.Message,
+        color: str,
+        defaults: dict
+    ):
+        super().__init__(title="Edit Embed")
+        self.cog = cog
+        self.message = message
+        self.color = color
+
+        self.message_content = discord.ui.TextInput(
+            label="Message Above The Embed",
+            placeholder="Optional text above the embed. Discord markdown works here.",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            default=defaults.get("content"),
+            max_length=2000
+        )
+        self.embed_title = discord.ui.TextInput(
+            label="Embed Title",
+            placeholder="Announcement",
+            required=True,
+            default=defaults.get("title") or "Announcement",
+            max_length=256
+        )
+        self.embed_description = discord.ui.TextInput(
+            label="Embed Description",
+            placeholder="Write the embed body here.",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            default=defaults.get("description"),
+            max_length=4000
+        )
+        self.image_url = discord.ui.TextInput(
+            label="Embed Image URL",
+            placeholder="Optional image URL",
+            required=False,
+            default=defaults.get("image_url"),
+            max_length=1000
+        )
+        self.thumbnail_url = discord.ui.TextInput(
+            label="Thumbnail URL",
+            placeholder="Optional thumbnail URL",
+            required=False,
+            default=defaults.get("thumbnail_url"),
+            max_length=1000
+        )
+        self.footer = discord.ui.TextInput(
+            label="Footer Text",
+            placeholder="Optional footer text",
+            required=False,
+            default=defaults.get("footer"),
+            max_length=2048
+        )
+
+        for item in [
+            self.message_content,
+            self.embed_title,
+            self.embed_description,
+            self.image_url,
+            self.thumbnail_url,
+            self.footer
+        ]:
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog._submit_embed_edit_modal(
+            interaction,
+            message=self.message,
+            color=self.color,
+            content=self.message_content.value.strip() or None,
+            title=self.embed_title.value.strip() or "Announcement",
+            description=self.embed_description.value,
+            image_url=self.image_url.value.strip() or None,
+            thumbnail_url=self.thumbnail_url.value.strip() or None,
             footer=self.footer.value.strip() or None
         )
 
@@ -148,6 +245,69 @@ class EmbedBuilder(commands.Cog):
         permissions = channel.permissions_for(bot_member)
         required = ["view_channel", "send_messages", "embed_links"]
         return [permission for permission in required if not getattr(permissions, permission, False)]
+
+    def _extract_embed_defaults(self, message: discord.Message) -> dict:
+        """Extract editable defaults from the first embed on a message."""
+        embed = message.embeds[0] if message.embeds else None
+        color_value = "#5865F2"
+        if embed is not None and embed.color is not None and embed.color.value is not None:
+            color_value = f"#{embed.color.value:06X}"
+
+        return {
+            "content": message.content or None,
+            "title": embed.title if embed else None,
+            "description": embed.description if embed else None,
+            "image_url": embed.image.url if embed and embed.image else None,
+            "thumbnail_url": embed.thumbnail.url if embed and embed.thumbnail else None,
+            "footer": embed.footer.text if embed and embed.footer else None,
+            "color": color_value
+        }
+
+    async def _fetch_editable_message(
+        self,
+        channel: discord.TextChannel,
+        message_id: int,
+        *,
+        require_embed: bool = True
+    ) -> tuple[Optional[discord.Message], Optional[str]]:
+        """Fetch a bot-authored message that is safe to edit."""
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            return None, "I couldn't find a message with that ID in the selected channel."
+        except discord.Forbidden:
+            return None, f"I don't have permission to read message history in {channel.mention}."
+        except discord.HTTPException as error:
+            self._log_exception("Failed to fetch editable message", error)
+            return None, "Discord rejected the message lookup. Please try again."
+
+        if self.bot.user is None or message.author.id != self.bot.user.id:
+            return None, "I can only edit messages that were sent by this bot."
+
+        if require_embed and not message.embeds:
+            return None, "That bot message does not currently contain an embed to edit."
+
+        return message, None
+
+    def _build_embed(
+        self,
+        *,
+        title: str,
+        description: str,
+        color_value: int,
+        footer: Optional[str] = None,
+        image_url: Optional[str] = None,
+        thumbnail_url: Optional[str] = None
+    ) -> discord.Embed:
+        """Build a standard editable embed."""
+        return EmbedFactory.create(
+            title=title,
+            description=description,
+            color=color_value,
+            footer=footer,
+            thumbnail=thumbnail_url,
+            image=image_url
+        )
 
     async def _get_verification_view(
         self, guild: discord.Guild
@@ -192,6 +352,8 @@ class EmbedBuilder(commands.Cog):
         color: str,
         verification: bool,
         button_label: str,
+        edit_message: Optional[discord.Message] = None,
+        persist_rules_config: bool = False,
         panel_message: Optional[str],
         title: str,
         rules_text: str,
@@ -222,7 +384,7 @@ class EmbedBuilder(commands.Cog):
             return
 
         view = None
-        verification_cog = None
+        verification_cog = self.bot.get_cog("Verification") if persist_rules_config else None
         if verification:
             view, verification_cog, error_message = await self._get_rules_accept_view(
                 interaction.guild,
@@ -236,28 +398,31 @@ class EmbedBuilder(commands.Cog):
                 return
 
         try:
-            embed = EmbedFactory.create(
+            embed = self._build_embed(
                 title=title,
                 description=rules_text,
-                color=color_value,
-                footer=footer
+                color_value=color_value,
+                footer=footer,
+                image_url=image_url
             )
-            if image_url:
-                embed.set_image(url=image_url)
+            if edit_message is None:
+                sent_message = await channel.send(content=panel_message, embed=embed, view=view)
+            else:
+                sent_message = await edit_message.edit(content=panel_message, embed=embed, view=view)
 
-            await channel.send(content=panel_message, embed=embed, view=view)
-
-            if verification and verification_cog is not None:
+            if persist_rules_config and verification_cog is not None:
                 await verification_cog.save_rules_panel_config(
                     interaction.guild.id,
                     channel_id=channel.id,
+                    message_id=sent_message.id,
                     panel_message=panel_message,
                     title=title,
                     description=rules_text,
                     color=color,
                     image_url=image_url,
                     footer=footer,
-                    button_label=button_label
+                    button_label=button_label,
+                    enabled=verification
                 )
 
             confirmation = "Rules panel sent successfully."
@@ -265,14 +430,21 @@ class EmbedBuilder(commands.Cog):
                 confirmation = (
                     "Rules panel sent successfully and the Accept button is now the verification step for incoming members."
                 )
+            if edit_message is not None:
+                confirmation = "Rules panel updated successfully."
+                if verification:
+                    confirmation = (
+                        "Rules panel updated successfully and the Accept button remains the verification step for incoming members."
+                    )
 
             await interaction.response.send_message(
                 embed=EmbedFactory.success("Rules Sent", f"{confirmation} Posted in {channel.mention}."),
                 ephemeral=True
             )
             logger.info(
-                "%s created a rules panel in %s (%s) with verification=%s",
+                "%s %s a rules panel in %s (%s) with verification=%s",
                 interaction.user,
+                "updated" if edit_message is not None else "created",
                 channel.guild,
                 channel.id,
                 verification
@@ -291,6 +463,67 @@ class EmbedBuilder(commands.Cog):
                 embed=EmbedFactory.error(
                     "Send Failed",
                     "Discord rejected that rules panel. Please review the content and any image URL."
+                ),
+                ephemeral=True
+            )
+
+    async def _submit_embed_edit_modal(
+        self,
+        interaction: discord.Interaction,
+        *,
+        message: discord.Message,
+        color: str,
+        content: Optional[str],
+        title: str,
+        description: str,
+        image_url: Optional[str],
+        thumbnail_url: Optional[str],
+        footer: Optional[str]
+    ) -> None:
+        """Edit an existing bot-authored embed message."""
+        color_value = self._parse_color(color)
+        if color_value is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Invalid Colour",
+                    "Please provide a valid 6-digit hex colour such as `#5865F2`."
+                ),
+                ephemeral=True
+            )
+            return
+
+        try:
+            embed = self._build_embed(
+                title=title,
+                description=description,
+                color_value=color_value,
+                footer=footer,
+                image_url=image_url,
+                thumbnail_url=thumbnail_url
+            )
+            await message.edit(content=content, embed=embed)
+            await interaction.response.send_message(
+                embed=EmbedFactory.success(
+                    "Embed Updated",
+                    f"The embed in {message.channel.mention} was updated successfully."
+                ),
+                ephemeral=True
+            )
+            logger.info("%s edited embed message %s in %s", interaction.user, message.id, message.guild)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Bot Missing Permissions",
+                    f"I don't have permission to edit that message in {message.channel.mention}."
+                ),
+                ephemeral=True
+            )
+        except discord.HTTPException as error:
+            self._log_exception("Failed to edit custom embed", error)
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Edit Failed",
+                    "Discord rejected that embed update. Please double-check the content and any image URLs."
                 ),
                 ephemeral=True
             )
@@ -467,7 +700,8 @@ class EmbedBuilder(commands.Cog):
                 color=color,
                 verification=verification,
                 title=title,
-                button_label=button_label or "Accept"
+                button_label=button_label or "Accept",
+                persist_rules_config=verification
             )
             await interaction.response.send_modal(modal)
         except Exception as error:
@@ -476,6 +710,137 @@ class EmbedBuilder(commands.Cog):
                 embed=EmbedFactory.error(
                     "Setup Failed",
                     "I couldn't open the rules panel builder. Please try again."
+                ),
+                ephemeral=True
+            )
+
+    @app_commands.command(name="embed_edit", description="Edit an existing bot embed in a channel")
+    @app_commands.describe(
+        channel="Channel containing the embed message",
+        message_id="Message ID of the bot embed to edit",
+        color="Hex color, such as #5865F2"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_messages=True)
+    @can_manage_embeds()
+    async def embed_edit(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        message_id: int,
+        color: Optional[str] = None
+    ):
+        """Open an editor for an existing bot-authored embed message."""
+        message, error_message = await self._fetch_editable_message(channel, message_id)
+        if error_message:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Edit Unavailable", error_message),
+                ephemeral=True
+            )
+            return
+
+        defaults = self._extract_embed_defaults(message)
+        color_value = color or defaults["color"]
+        if self._parse_color(color_value) is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Invalid Colour",
+                    "Please provide a valid 6-digit hex colour such as `#5865F2`."
+                ),
+                ephemeral=True
+            )
+            return
+
+        try:
+            modal = EmbedEditModal(
+                self,
+                message=message,
+                color=color_value,
+                defaults=defaults
+            )
+            await interaction.response.send_modal(modal)
+        except Exception as error:
+            self._log_exception("Failed to open embed edit modal", error)
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Setup Failed",
+                    "I couldn't open the embed editor. Please try again."
+                ),
+                ephemeral=True
+            )
+
+    @app_commands.command(name="embed_rules_edit", description="Edit an existing rules panel in place")
+    @app_commands.describe(
+        channel="Channel containing the rules panel",
+        message_id="Message ID of the rules panel message",
+        color="Hex color, such as #5865F2",
+        verification="Keep or remove the verification button under this panel",
+        button_label="Label for the rules acceptance button when verification is enabled"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_messages=True)
+    @can_manage_embeds()
+    async def embed_rules_edit(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        message_id: int,
+        color: Optional[str] = None,
+        verification: Optional[bool] = None,
+        button_label: Optional[str] = None
+    ):
+        """Open the rules panel editor for an existing bot-authored message."""
+        message, error_message = await self._fetch_editable_message(channel, message_id)
+        if error_message:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Edit Unavailable", error_message),
+                ephemeral=True
+            )
+            return
+
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        defaults = self._extract_embed_defaults(message)
+        color_value = color or defaults["color"]
+        if self._parse_color(color_value) is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Invalid Colour",
+                    "Please provide a valid 6-digit hex colour such as `#5865F2`."
+                ),
+                ephemeral=True
+            )
+            return
+
+        verification_enabled = (
+            verification
+            if verification is not None
+            else bool(guild_config.get("rules_panel_enabled", False)) if guild_config else False
+        )
+        resolved_button_label = (
+            button_label
+            or (guild_config.get("rules_button_label") if guild_config else None)
+            or "Accept"
+        )
+
+        try:
+            modal = RulesEmbedModal(
+                self,
+                channel,
+                color=color_value,
+                verification=verification_enabled,
+                title=defaults.get("title") or "Server Rules",
+                button_label=resolved_button_label,
+                edit_message=message,
+                defaults=defaults,
+                persist_rules_config=True
+            )
+            await interaction.response.send_modal(modal)
+        except Exception as error:
+            self._log_exception("Failed to open rules panel edit modal", error)
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Setup Failed",
+                    "I couldn't open the rules panel editor. Please try again."
                 ),
                 ephemeral=True
             )
