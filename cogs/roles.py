@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 MAX_COLOR_PANEL_OPTIONS = 25
 COLOR_MENU_SIZE = 25
 ROLE_MENU_COLLECTION = "role_menus"
+ROLE_MENTION_PATTERN = re.compile(r"<@&(\d+)>")
+ROLE_ID_PATTERN = re.compile(r"\b\d{17,20}\b")
+AT_ROLE_NAME_PATTERN = re.compile(r"@([^@]+?)(?=(?:\s*@)|$)", re.DOTALL)
 NAMED_COLOR_PALETTE = [
     ("Crimson", "#D12E2E"),
     ("Ember", "#D14D24"),
@@ -86,8 +89,8 @@ class RoleMenuSetupModal(discord.ui.Modal, title="Create Role Menu"):
     )
 
     role_mentions = discord.ui.TextInput(
-        label="Roles (mention with @)",
-        placeholder="Type @ and select roles. Example: @Gamer @Artist @Developer",
+        label="Roles (@RoleName, mention, or role ID)",
+        placeholder="Example: @Gamer @Artist @Developer",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=1000
@@ -105,47 +108,92 @@ class RoleMenuSetupModal(discord.ui.Modal, title="Create Role Menu"):
         self.cog = cog
         self.channel = channel
 
+    def _extract_role_name_candidates(self, text: str) -> List[str]:
+        """Extract plain-text @RoleName entries from a modal text input."""
+        candidates = []
+        for match in AT_ROLE_NAME_PATTERN.findall(text):
+            candidate = " ".join(match.strip().split())
+            candidate = candidate.rstrip(",;")
+            if candidate:
+                candidates.append(candidate)
+
+        if candidates:
+            return candidates
+
+        fallback_candidates = []
+        for chunk in re.split(r"[\n,;]+", text):
+            candidate = chunk.strip()
+            if candidate.startswith("@"):
+                candidate = candidate[1:].strip()
+            if candidate:
+                fallback_candidates.append(candidate)
+        return fallback_candidates
+
     async def on_submit(self, interaction: discord.Interaction):
         """Handle modal submission"""
-        import re
-        
         # Parse exclusive setting
         is_exclusive = self.exclusive.value.lower() in ['yes', 'y', 'true']
 
-        # Parse role mentions
+        # Parse role references
         role_list = []
         text = self.role_mentions.value
-        role_ids = re.findall(r'<@&(\d+)>', text)
+        resolved_roles = []
+        seen_role_ids = set()
 
-        if not role_ids:
+        role_ids = ROLE_MENTION_PATTERN.findall(text)
+        role_ids.extend(ROLE_ID_PATTERN.findall(text))
+        for role_id in role_ids:
+            role = interaction.guild.get_role(int(role_id))
+            if role and role.id not in seen_role_ids:
+                resolved_roles.append(role)
+                seen_role_ids.add(role.id)
+
+        role_name_candidates = self._extract_role_name_candidates(text)
+        if role_name_candidates:
+            guild_roles_by_name = {}
+            for role in interaction.guild.roles:
+                normalized = role.name.casefold()
+                guild_roles_by_name.setdefault(normalized, role)
+
+            for candidate in role_name_candidates:
+                role = guild_roles_by_name.get(candidate.casefold())
+                if role and role.id not in seen_role_ids:
+                    resolved_roles.append(role)
+                    seen_role_ids.add(role.id)
+
+        if not resolved_roles:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("No Roles Found", "Please mention roles using @. Type @ and select roles from the list that appears."),
+                embed=EmbedFactory.error(
+                    "No Roles Found",
+                    "I couldn't resolve any roles from that input. In this modal, use plain `@RoleName`, a pasted role mention, or a raw role ID."
+                ),
                 ephemeral=True
             )
             return
 
-        for role_id in role_ids:
-            role = interaction.guild.get_role(int(role_id))
-            if role:
-                # Skip @everyone and bot integration roles
-                if role.is_default() or role.is_integration():
-                    continue
-                    
-                role_emoji = None
-                if role.unicode_emoji:
-                    role_emoji = role.unicode_emoji
-                elif role.icon:
-                    role_emoji = str(role.icon)
+        for role in resolved_roles:
+            # Skip @everyone and bot integration roles
+            if role.is_default() or role.is_integration():
+                continue
 
-                role_list.append({
-                    'role': role,
-                    'emoji': role_emoji or "🎭",
-                    'label': role.name
-                })
+            role_emoji = None
+            if role.unicode_emoji:
+                role_emoji = role.unicode_emoji
+            elif role.icon:
+                role_emoji = str(role.icon)
+
+            role_list.append({
+                'role': role,
+                'emoji': role_emoji or "🎭",
+                'label': role.name
+            })
 
         if not role_list:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("No Valid Roles", f"Found {len(role_ids)} role mentions but they cannot be used (might be bot roles or @everyone)."),
+                embed=EmbedFactory.error(
+                    "No Valid Roles",
+                    "I resolved role references, but they were not usable here. Managed roles, integration roles, and `@everyone` are skipped."
+                ),
                 ephemeral=True
             )
             return
@@ -537,26 +585,9 @@ class Roles(commands.Cog):
         category_name: str,
         selected_role_id: int
     ) -> None:
-        """Assign a role from an exclusive menu and refresh the component state."""
+        """Assign or switch a role from an exclusive menu while keeping one-role-only rules."""
         try:
             await interaction.response.defer(ephemeral=True, thinking=False)
-
-            existing_role = None
-            for role_info in role_data:
-                role = interaction.guild.get_role(role_info["role"].id)
-                if role and role in interaction.user.roles:
-                    existing_role = role
-                    break
-
-            if existing_role:
-                await interaction.followup.send(
-                    embed=EmbedFactory.error(
-                        "🔒 Role Already Selected",
-                        f"You already have **{existing_role.name}**. You cannot select another role from this menu."
-                    ),
-                    ephemeral=True
-                )
-                return
 
             selected_role = interaction.guild.get_role(selected_role_id)
             if not selected_role:
@@ -566,13 +597,44 @@ class Roles(commands.Cog):
                 )
                 return
 
-            await interaction.user.add_roles(selected_role, reason="Exclusive role menu selection")
+            current_menu_roles = []
+            for role_info in role_data:
+                role = interaction.guild.get_role(role_info["role"].id)
+                if role and role in interaction.user.roles:
+                    current_menu_roles.append(role)
 
-            embed = EmbedFactory.success(
-                "✅ Role Selected!",
-                f"You now have the **{selected_role.name}** role!\n\n"
-                f"**Note:** You cannot select another role from this menu."
-            )
+            if len(current_menu_roles) == 1 and current_menu_roles[0].id == selected_role_id:
+                await interaction.followup.send(
+                    embed=EmbedFactory.info(
+                        "Already Selected",
+                        f"You already have **{selected_role.name}** from this menu."
+                    ),
+                    ephemeral=True
+                )
+                return
+
+            roles_to_remove = [role for role in current_menu_roles if role.id != selected_role_id]
+            if roles_to_remove:
+                await interaction.user.remove_roles(*roles_to_remove, reason="Exclusive role menu switch")
+
+            if selected_role not in interaction.user.roles:
+                await interaction.user.add_roles(selected_role, reason="Exclusive role menu selection")
+
+            if roles_to_remove:
+                removed_text = ", ".join(role.name for role in roles_to_remove)
+                description = (
+                    f"You now have the **{selected_role.name}** role.\n\n"
+                    f"**Removed:** {removed_text}\n"
+                    "**Rule:** You can only hold one role from this menu at a time."
+                )
+                embed = EmbedFactory.success("✅ Role Switched!", description)
+            else:
+                embed = EmbedFactory.success(
+                    "✅ Role Selected!",
+                    f"You now have the **{selected_role.name}** role.\n\n"
+                    "**Rule:** You can only hold one role from this menu at a time."
+                )
+
             await self._refresh_role_menu_message(
                 interaction.message,
                 menu_type="exclusive",
@@ -580,7 +642,7 @@ class Roles(commands.Cog):
                 category_name=category_name
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
-            logger.info("%s selected exclusive role %s", interaction.user, selected_role.name)
+            logger.info("%s selected/switched exclusive role %s", interaction.user, selected_role.name)
         except discord.Forbidden:
             sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
             await sender(
