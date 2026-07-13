@@ -19,6 +19,10 @@ from utils.embeds import EmbedFactory
 logger = logging.getLogger(__name__)
 
 HEX_COLOR_PATTERN = re.compile(r"^#?[0-9A-Fa-f]{6}$")
+MESSAGE_ID_PATTERN = re.compile(r"^\d{17,20}$")
+MESSAGE_URL_PATTERN = re.compile(
+    r"^https?://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/\d+/\d+/(\d{17,20})/?$"
+)
 
 
 def can_manage_embeds():
@@ -227,6 +231,18 @@ class EmbedBuilder(commands.Cog):
         if not HEX_COLOR_PATTERN.fullmatch(value):
             return None
         return int(value.lstrip("#"), 16)
+
+    def _parse_message_reference(self, value: str) -> Optional[int]:
+        """Parse a raw message ID or Discord message URL into an integer ID."""
+        candidate = value.strip()
+        if MESSAGE_ID_PATTERN.fullmatch(candidate):
+            return int(candidate)
+
+        url_match = MESSAGE_URL_PATTERN.fullmatch(candidate)
+        if url_match:
+            return int(url_match.group(1))
+
+        return None
 
     def _format_permissions(self, permissions: list[str]) -> str:
         """Format permission names for user-facing error messages."""
@@ -717,7 +733,7 @@ class EmbedBuilder(commands.Cog):
     @app_commands.command(name="embed_edit", description="Edit an existing bot embed in a channel")
     @app_commands.describe(
         channel="Channel containing the embed message",
-        message_id="Message ID of the bot embed to edit",
+        message_id="Message ID or Discord message link for the bot embed to edit",
         color="Hex color, such as #5865F2"
     )
     @app_commands.guild_only()
@@ -727,11 +743,22 @@ class EmbedBuilder(commands.Cog):
         self,
         interaction: discord.Interaction,
         channel: discord.TextChannel,
-        message_id: int,
+        message_id: str,
         color: Optional[str] = None
     ):
         """Open an editor for an existing bot-authored embed message."""
-        message, error_message = await self._fetch_editable_message(channel, message_id)
+        parsed_message_id = self._parse_message_reference(message_id)
+        if parsed_message_id is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Invalid Message ID",
+                    "Please provide either a raw Discord message ID or a full Discord message link."
+                ),
+                ephemeral=True
+            )
+            return
+
+        message, error_message = await self._fetch_editable_message(channel, parsed_message_id)
         if error_message:
             await interaction.response.send_message(
                 embed=EmbedFactory.error("Edit Unavailable", error_message),
@@ -772,7 +799,7 @@ class EmbedBuilder(commands.Cog):
     @app_commands.command(name="embed_rules_edit", description="Edit an existing rules panel in place")
     @app_commands.describe(
         channel="Channel containing the rules panel",
-        message_id="Message ID of the rules panel message",
+        message_id="Message ID or Discord message link for the rules panel",
         color="Hex color, such as #5865F2",
         verification="Keep or remove the verification button under this panel",
         button_label="Label for the rules acceptance button when verification is enabled"
@@ -784,13 +811,24 @@ class EmbedBuilder(commands.Cog):
         self,
         interaction: discord.Interaction,
         channel: discord.TextChannel,
-        message_id: int,
+        message_id: str,
         color: Optional[str] = None,
         verification: Optional[bool] = None,
         button_label: Optional[str] = None
     ):
         """Open the rules panel editor for an existing bot-authored message."""
-        message, error_message = await self._fetch_editable_message(channel, message_id)
+        parsed_message_id = self._parse_message_reference(message_id)
+        if parsed_message_id is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Invalid Message ID",
+                    "Please provide either a raw Discord message ID or a full Discord message link."
+                ),
+                ephemeral=True
+            )
+            return
+
+        message, error_message = await self._fetch_editable_message(channel, parsed_message_id)
         if error_message:
             await interaction.response.send_message(
                 embed=EmbedFactory.error("Edit Unavailable", error_message),
