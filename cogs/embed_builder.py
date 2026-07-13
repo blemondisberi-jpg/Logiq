@@ -165,18 +165,15 @@ class EmbedEditModal(discord.ui.Modal):
             default=defaults.get("description"),
             max_length=4000
         )
-        self.image_url = discord.ui.TextInput(
-            label="Embed Image URL",
-            placeholder="Optional image URL",
-            required=False,
-            default=defaults.get("image_url"),
-            max_length=1000
+        visual_default = self.cog._format_visual_defaults(
+            defaults.get("image_url"),
+            defaults.get("thumbnail_url")
         )
-        self.thumbnail_url = discord.ui.TextInput(
-            label="Thumbnail URL",
-            placeholder="Optional thumbnail URL",
+        self.visual_urls = discord.ui.TextInput(
+            label="Image URL | Thumbnail URL",
+            placeholder="Optional. Use `image_url | thumbnail_url` or just one image URL.",
             required=False,
-            default=defaults.get("thumbnail_url"),
+            default=visual_default,
             max_length=1000
         )
         self.footer = discord.ui.TextInput(
@@ -191,13 +188,13 @@ class EmbedEditModal(discord.ui.Modal):
             self.message_content,
             self.embed_title,
             self.embed_description,
-            self.image_url,
-            self.thumbnail_url,
+            self.visual_urls,
             self.footer
         ]:
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
+        image_url, thumbnail_url = self.cog._parse_visual_urls(self.visual_urls.value)
         await self.cog._submit_embed_edit_modal(
             interaction,
             message=self.message,
@@ -205,8 +202,8 @@ class EmbedEditModal(discord.ui.Modal):
             content=self.message_content.value.strip() or None,
             title=self.embed_title.value.strip() or "Announcement",
             description=self.embed_description.value,
-            image_url=self.image_url.value.strip() or None,
-            thumbnail_url=self.thumbnail_url.value.strip() or None,
+            image_url=image_url,
+            thumbnail_url=thumbnail_url,
             footer=self.footer.value.strip() or None
         )
 
@@ -278,6 +275,36 @@ class EmbedBuilder(commands.Cog):
             "footer": embed.footer.text if embed and embed.footer else None,
             "color": color_value
         }
+
+    def _format_visual_defaults(
+        self,
+        image_url: Optional[str],
+        thumbnail_url: Optional[str]
+    ) -> Optional[str]:
+        """Format existing image and thumbnail URLs into one editable field."""
+        image_value = (image_url or "").strip()
+        thumbnail_value = (thumbnail_url or "").strip()
+        if image_value and thumbnail_value:
+            return f"{image_value} | {thumbnail_value}"
+        if image_value:
+            return image_value
+        if thumbnail_value:
+            return f"| {thumbnail_value}"
+        return None
+
+    def _parse_visual_urls(self, value: str) -> tuple[Optional[str], Optional[str]]:
+        """Parse a combined image/thumbnail field into separate values."""
+        candidate = value.strip()
+        if not candidate:
+            return None, None
+
+        if "|" in candidate:
+            image_part, thumbnail_part = candidate.split("|", 1)
+            image_url = image_part.strip() or None
+            thumbnail_url = thumbnail_part.strip() or None
+            return image_url, thumbnail_url
+
+        return candidate, None
 
     async def _fetch_editable_message(
         self,
