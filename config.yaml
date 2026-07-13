@@ -98,6 +98,8 @@ api_keys:
   twitch_client_secret: ""
   twitch_eventsub_secret: ""
   youtube: ""
+  youtube_oauth_client_id: ""
+  youtube_oauth_client_secret: ""
   kick_client_id: ""
   kick_client_secret: ""
   spotify_client_id: ""

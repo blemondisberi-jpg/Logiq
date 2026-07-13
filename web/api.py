@@ -17,10 +17,12 @@ import os
 
 logger = logging.getLogger(__name__)
 TWITCH_EVENTSUB_PATH = "/webhooks/twitch/eventsub"
+KICK_EVENTS_PATH = "/webhooks/kick/events"
+YOUTUBE_OAUTH_CALLBACK_PATH = "/oauth/youtube/callback"
 
 
-def parse_twitch_rfc3339(timestamp: str) -> datetime | None:
-    """Parse Twitch RFC3339 timestamps, including nanosecond precision."""
+def parse_rfc3339_timestamp(timestamp: str) -> datetime | None:
+    """Parse RFC3339 timestamps, including nanosecond precision."""
     if not timestamp:
         return None
 
@@ -241,7 +243,7 @@ def create_app(bot) -> FastAPI:
                 logger.warning("Rejected Twitch EventSub request due to missing headers")
                 raise HTTPException(status_code=400, detail="Missing Twitch EventSub headers")
 
-            sent_at = parse_twitch_rfc3339(timestamp)
+            sent_at = parse_rfc3339_timestamp(timestamp)
             if sent_at is None:
                 logger.warning("Rejected Twitch EventSub request due to invalid timestamp: %s", timestamp)
                 raise HTTPException(status_code=400, detail="Invalid Twitch EventSub timestamp")
@@ -315,5 +317,98 @@ def create_app(bot) -> FastAPI:
                 status_code=500,
                 content={"detail": "Internal Twitch EventSub webhook error"}
             )
+
+    @app.post(KICK_EVENTS_PATH)
+    async def kick_events_webhook(request: Request):
+        """Receive Kick webhook callbacks."""
+        try:
+            social_alerts = bot.get_cog("SocialAlerts")
+            if social_alerts is None:
+                raise HTTPException(status_code=503, detail="Social alerts cog is not loaded")
+
+            body = await request.body()
+            message_id = request.headers.get("Kick-Event-Message-Id", "")
+            timestamp = request.headers.get("Kick-Event-Message-Timestamp", "")
+            signature = request.headers.get("Kick-Event-Signature", "")
+            event_type = request.headers.get("Kick-Event-Type", "")
+            logger.info(
+                "Incoming Kick webhook request: type=%s id=%s body_bytes=%s",
+                event_type or "missing",
+                message_id or "missing",
+                len(body),
+            )
+
+            if not message_id or not timestamp or not signature or not event_type:
+                logger.warning("Rejected Kick webhook request due to missing headers")
+                raise HTTPException(status_code=400, detail="Missing Kick webhook headers")
+
+            sent_at = parse_rfc3339_timestamp(timestamp)
+            if sent_at is None:
+                logger.warning("Rejected Kick webhook request due to invalid timestamp: %s", timestamp)
+                raise HTTPException(status_code=400, detail="Invalid Kick webhook timestamp")
+
+            if abs((datetime.now(timezone.utc) - sent_at).total_seconds()) > 600:
+                logger.warning("Rejected Kick webhook request because timestamp was too old: %s", timestamp)
+                raise HTTPException(status_code=400, detail="Kick webhook message is too old")
+
+            if not await social_alerts.verify_kick_event_signature(body, message_id, timestamp, signature):
+                logger.warning("Rejected Kick webhook request because signature verification failed")
+                raise HTTPException(status_code=403, detail="Invalid Kick webhook signature")
+
+            if message_id in social_alerts._recent_kick_event_messages:
+                logger.info("Ignoring duplicate Kick webhook request id=%s", message_id)
+                return Response(status_code=200)
+
+            social_alerts._recent_kick_event_messages[message_id] = datetime.now(timezone.utc)
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+            social_alerts._recent_kick_event_messages = {
+                key: value
+                for key, value in list(social_alerts._recent_kick_event_messages.items())
+                if value >= cutoff
+            }
+
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except json.JSONDecodeError as error:
+                logger.warning("Rejected Kick webhook request due to invalid JSON: %s", error)
+                raise HTTPException(status_code=400, detail="Invalid Kick webhook payload")
+
+            await social_alerts.handle_kick_event_request(event_type, payload)
+            return Response(status_code=204)
+        except HTTPException:
+            raise
+        except Exception as error:
+            logger.exception("Unhandled error while processing Kick webhook: %s", error)
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Internal Kick webhook error"}
+            )
+
+    @app.get(YOUTUBE_OAUTH_CALLBACK_PATH, response_class=HTMLResponse)
+    async def youtube_oauth_callback(
+        state: Optional[str] = None,
+        code: Optional[str] = None,
+        error: Optional[str] = None,
+    ):
+        """Complete the optional YouTube owner OAuth flow for social alerts."""
+        social_alerts = bot.get_cog("SocialAlerts")
+        if social_alerts is None:
+            raise HTTPException(status_code=503, detail="Social alerts cog is not loaded")
+
+        title, message = await social_alerts.handle_youtube_oauth_callback(
+            state=state or "",
+            code=code,
+            error=error
+        )
+        return f"""
+        <html>
+            <head><title>{title}</title></head>
+            <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto; line-height: 1.5;">
+                <h1>{title}</h1>
+                <p>{message}</p>
+                <p>You can close this page and return to Discord.</p>
+            </body>
+        </html>
+        """
 
     return app
