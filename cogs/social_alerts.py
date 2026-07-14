@@ -7,6 +7,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
 import secrets
@@ -957,13 +958,23 @@ class SocialAlerts(commands.Cog):
         try:
             async with session.get("https://api.kick.com/public/v1/public-key") as response:
                 if response.status == 200:
-                    body = await response.text()
-                    body = body.strip()
-                    if body:
-                        pem = body
+                    body = (await response.text()).strip()
+                    payload = None
+                    try:
+                        payload = json.loads(body)
+                    except json.JSONDecodeError:
+                        payload = None
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if isinstance(data, dict):
+                        candidate = data.get("public_key")
+                        if isinstance(candidate, str) and candidate.strip():
+                            pem = candidate.strip()
+                    if not pem:
+                        if body and body.startswith("-----BEGIN PUBLIC KEY-----"):
+                            pem = body
                 else:
                     logger.warning("Failed to refresh Kick public key: HTTP %s", response.status)
-        except aiohttp.ClientError as error:
+        except (aiohttp.ClientError, ValueError) as error:
             logger.warning("Could not fetch Kick public key dynamically: %s", error)
 
         pem = pem or KICK_WEBHOOK_PUBLIC_KEY_FALLBACK
@@ -1194,8 +1205,8 @@ class SocialAlerts(commands.Cog):
 
         created = {}
         for item in data.get("data", []):
-            event_name = item.get("event")
-            sub_id = item.get("id")
+            event_name = item.get("event") or item.get("name")
+            sub_id = item.get("id") or item.get("subscription_id")
             if event_name and sub_id:
                 created[event_name] = sub_id
         return created, None
@@ -1210,7 +1221,11 @@ class SocialAlerts(commands.Cog):
         headers = {"Authorization": f"Bearer {token}"}
 
         try:
-            async with session.delete(f"https://api.kick.com/public/v1/events/subscriptions/{subscription_id}", headers=headers) as response:
+            async with session.delete(
+                "https://api.kick.com/public/v1/events/subscriptions",
+                params=[("id", subscription_id)],
+                headers=headers
+            ) as response:
                 if response.status not in (200, 204, 404):
                     body = await response.text()
                     logger.error("Failed to delete Kick subscription %s: %s %s", subscription_id, response.status, body)
@@ -1297,6 +1312,7 @@ class SocialAlerts(commands.Cog):
                     {"_id": alert["_id"]},
                     {"$set": {"kick_broadcaster_id": broadcaster_id}}
                 )
+                alert["kick_broadcaster_id"] = broadcaster_id
 
         subscriptions, sub_error = await self._list_kick_event_subscriptions()
         if sub_error:
@@ -2066,6 +2082,7 @@ class SocialAlerts(commands.Cog):
     async def handle_kick_event_request(self, event_type: str, payload: dict) -> None:
         """Process Kick webhook payloads."""
         if event_type not in KICK_EVENT_TYPES:
+            logger.info("Ignoring unsupported Kick webhook event type: %s", event_type)
             return
 
         broadcaster = payload.get("broadcaster") or {}
@@ -2076,7 +2093,16 @@ class SocialAlerts(commands.Cog):
             broadcaster_id_int = None
         channel_slug = (broadcaster.get("channel_slug") or "").lower()
         if broadcaster_id_int is None and not channel_slug:
+            logger.warning("Kick webhook payload was missing broadcaster identifiers for event %s", event_type)
             return
+
+        logger.info(
+            "Processing Kick webhook event: type=%s broadcaster_id=%s channel_slug=%s is_live=%s",
+            event_type,
+            broadcaster_id_int,
+            channel_slug or "missing",
+            payload.get("is_live"),
+        )
 
         alerts = await self.db.db.social_alerts.find({
             "platform": "kick",
@@ -2086,6 +2112,12 @@ class SocialAlerts(commands.Cog):
             ]
         }).to_list(length=1000)
         if not alerts:
+            logger.warning(
+                "Kick webhook event matched no configured alerts: type=%s broadcaster_id=%s channel_slug=%s",
+                event_type,
+                broadcaster_id_int,
+                channel_slug or "missing",
+            )
             return
 
         is_live = bool(payload.get("is_live"))
@@ -2150,6 +2182,11 @@ class SocialAlerts(commands.Cog):
 
             sent = await self._send_kick_alert(alert, channel, channel_data)
             if sent:
+                await self._save_alert_delivery_metadata(
+                    alert["_id"],
+                    source="kick_webhook",
+                    discord_sent_at=discord.utils.utcnow().timestamp()
+                )
                 await self._save_alert_check_state(
                     alert["_id"],
                     status="sent",
@@ -2158,8 +2195,10 @@ class SocialAlerts(commands.Cog):
                     stream_title=channel_data.get("stream_title"),
                     stream_started_at=started_at
                 )
+                logger.info("Delivered Kick webhook alert for %s to channel %s", alert["username"], channel.id)
             else:
                 await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
+                logger.warning("Failed to deliver Kick webhook alert for %s to channel %s", alert["username"], channel.id)
 
     async def handle_youtube_oauth_callback(
         self,
