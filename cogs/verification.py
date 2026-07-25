@@ -3,6 +3,7 @@ Verification Cog for Logiq
 Handles user verification with multiple methods
 """
 
+import base64
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -34,6 +35,7 @@ DEFAULT_WELCOME_CARD_TEXT = "#F1C1CC"
 DEFAULT_WELCOME_CARD_SIZE = (1200, 520)
 DEFAULT_WELCOME_CARD_TITLE_SIZE = 74
 DEFAULT_WELCOME_CARD_SUBTITLE_SIZE = 44
+WELCOME_CARD_BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_VERIFICATION_MODE = "button"
 CAPTCHA_CODE_LENGTH = 6
 WELCOME_MEMBER_POSITION_COLLECTION = "welcome_member_positions"
@@ -1248,6 +1250,76 @@ class Verification(commands.Cog):
             logger.warning("Fetched welcome card background is not a valid image: %s", url)
             return None
 
+    def _encode_welcome_background_image(self, image: Image.Image) -> str:
+        """Normalize and encode a welcome background image for durable storage."""
+        normalized = ImageOps.fit(
+            image.convert("RGBA"),
+            DEFAULT_WELCOME_CARD_SIZE,
+            method=Image.Resampling.LANCZOS
+        )
+        output = BytesIO()
+        normalized.save(output, format="PNG", optimize=True, compress_level=9)
+        return base64.b64encode(output.getvalue()).decode("ascii")
+
+    def _decode_welcome_background_image(self, encoded_image: Optional[str]) -> Optional[Image.Image]:
+        """Decode a stored welcome background image."""
+        if not encoded_image:
+            return None
+
+        try:
+            image_bytes = base64.b64decode(encoded_image)
+            return Image.open(BytesIO(image_bytes)).convert("RGBA")
+        except (ValueError, OSError) as error:
+            logger.warning("Stored welcome card background could not be decoded: %s", error)
+            return None
+
+    async def _store_welcome_background_image(
+        self,
+        guild_id: int,
+        guild_config: dict,
+        image_bytes: bytes,
+        *,
+        source_url: Optional[str]
+    ) -> tuple[bool, Optional[str]]:
+        """Persist a normalized welcome background image in guild config."""
+        if len(image_bytes) > WELCOME_CARD_BACKGROUND_MAX_BYTES:
+            return False, "Background image files must be 8 MB or smaller."
+
+        try:
+            image = Image.open(BytesIO(image_bytes)).convert("RGBA")
+        except OSError:
+            return False, "That background image could not be opened. Please use a valid PNG, JPG, or WEBP image."
+
+        encoded_image = self._encode_welcome_background_image(image)
+        update_data = {
+            "welcome_card_background_image_data": encoded_image,
+            "welcome_card_background_url": source_url.strip() if source_url else None
+        }
+        await self.db.update_guild(guild_id, update_data)
+        guild_config.update(update_data)
+        return True, None
+
+    async def _cache_welcome_background_from_url(
+        self,
+        guild_id: int,
+        guild_config: dict,
+        url: str
+    ) -> Optional[Image.Image]:
+        """Fetch a remote background image once, then persist a durable copy."""
+        background = await self._fetch_url_image(url)
+        if background is None:
+            return None
+
+        encoded_image = self._encode_welcome_background_image(background)
+        update_data = {
+            "welcome_card_background_image_data": encoded_image,
+            "welcome_card_background_url": url
+        }
+        await self.db.update_guild(guild_id, update_data)
+        guild_config.update(update_data)
+        logger.info("Cached welcome card background image for guild %s from %s", guild_id, url)
+        return self._decode_welcome_background_image(encoded_image)
+
     async def _build_welcome_card(
         self,
         member: discord.Member,
@@ -1259,16 +1331,17 @@ class Verification(commands.Cog):
         width, height = DEFAULT_WELCOME_CARD_SIZE
         accent = self._parse_hex_color(guild_config.get("welcome_card_accent_color"), DEFAULT_WELCOME_CARD_ACCENT)
         text_color = self._parse_hex_color(guild_config.get("welcome_card_text_color"), DEFAULT_WELCOME_CARD_TEXT)
+        background_data = guild_config.get("welcome_card_background_image_data")
         background_url = guild_config.get("welcome_card_background_url")
+        background = self._decode_welcome_background_image(background_data)
 
-        if background_url:
-            background = await self._fetch_url_image(background_url)
-            if background is None:
-                background = Image.new("RGBA", (width, height), (24, 24, 31, 255))
-            else:
-                background = ImageOps.fit(background, (width, height), method=Image.Resampling.LANCZOS)
-        else:
+        if background is None and background_url:
+            background = await self._cache_welcome_background_from_url(member.guild.id, guild_config, background_url)
+
+        if background is None:
             background = Image.new("RGBA", (width, height), (24, 24, 31, 255))
+        else:
+            background = ImageOps.fit(background, (width, height), method=Image.Resampling.LANCZOS)
 
         overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
@@ -2118,7 +2191,8 @@ class Verification(commands.Cog):
         subtitle_size="Subtitle font size (24-140)",
         accent_color="Accent hex color such as #F5B8C7",
         text_color="Text hex color such as #F1C1CC",
-        background_image_url="Optional background image URL for the card"
+        background_image_url="Optional background image URL for the card",
+        background_image="Optional image upload to store directly for the card"
     )
     @app_commands.choices(title_font=WELCOME_CARD_FONT_CHOICES, subtitle_font=WELCOME_CARD_FONT_CHOICES)
     @is_admin()
@@ -2136,12 +2210,23 @@ class Verification(commands.Cog):
         subtitle_size: Optional[int] = None,
         accent_color: Optional[str] = None,
         text_color: Optional[str] = None,
-        background_image_url: Optional[str] = None
+        background_image_url: Optional[str] = None,
+        background_image: Optional[discord.Attachment] = None
     ):
         """Configure welcome card appearance and behavior."""
         guild_config = await self.db.get_guild(interaction.guild.id)
         if not guild_config:
             guild_config = await self.db.create_guild(interaction.guild.id)
+
+        if background_image_url is not None and background_image is not None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Choose One Background Source",
+                    "Use either `background_image_url` or `background_image` in one command, not both."
+                ),
+                ephemeral=True
+            )
+            return
 
         if accent_color is not None and not self._is_valid_hex_color(accent_color):
             await interaction.response.send_message(
@@ -2156,6 +2241,82 @@ class Verification(commands.Cog):
                 ephemeral=True
             )
             return
+
+        if background_image is not None:
+            if background_image.size and background_image.size > WELCOME_CARD_BACKGROUND_MAX_BYTES:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error(
+                        "Image Too Large",
+                        "Background image files must be 8 MB or smaller."
+                    ),
+                    ephemeral=True
+                )
+                return
+
+            if background_image.content_type and not background_image.content_type.startswith("image/"):
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error(
+                        "Invalid Background",
+                        "Please upload a valid image file for the welcome card background."
+                    ),
+                    ephemeral=True
+                )
+                return
+
+            try:
+                background_bytes = await background_image.read()
+            except discord.HTTPException as error:
+                logger.warning("Failed to read uploaded welcome card background: %s", error)
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error(
+                        "Upload Failed",
+                        "I couldn't download that uploaded image from Discord. Please try again."
+                    ),
+                    ephemeral=True
+                )
+                return
+
+            stored, store_error = await self._store_welcome_background_image(
+                interaction.guild.id,
+                guild_config,
+                background_bytes,
+                source_url=background_image.url
+            )
+            if not stored:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("Invalid Background", store_error or "That image could not be saved."),
+                    ephemeral=True
+                )
+                return
+
+        if background_image_url is not None:
+            trimmed_url = background_image_url.strip()
+            if not trimmed_url:
+                update_data = {
+                    "welcome_card_background_url": None,
+                    "welcome_card_background_image_data": None
+                }
+                await self.db.update_guild(interaction.guild.id, update_data)
+                guild_config.update(update_data)
+            else:
+                background = await self._fetch_url_image(trimmed_url)
+                if background is None:
+                    await interaction.response.send_message(
+                        embed=EmbedFactory.error(
+                            "Background Fetch Failed",
+                            "I couldn't download a valid image from that URL. Please use a direct image link or upload the file instead."
+                        ),
+                        ephemeral=True
+                    )
+                    return
+
+                encoded_image = self._encode_welcome_background_image(background)
+                update_data = {
+                    "welcome_card_background_url": trimmed_url,
+                    "welcome_card_background_image_data": encoded_image
+                }
+                await self.db.update_guild(interaction.guild.id, update_data)
+                guild_config.update(update_data)
 
         update_data = {}
         if channel is not None:
@@ -2186,8 +2347,6 @@ class Verification(commands.Cog):
             update_data["welcome_card_accent_color"] = accent_color
         if text_color is not None:
             update_data["welcome_card_text_color"] = text_color
-        if background_image_url is not None:
-            update_data["welcome_card_background_url"] = background_image_url.strip() or None
 
         if update_data:
             await self.db.update_guild(interaction.guild.id, update_data)
@@ -2214,7 +2373,12 @@ class Verification(commands.Cog):
                 {"name": "Subtitle", "value": guild_config.get("welcome_card_subtitle", DEFAULT_WELCOME_CARD_SUBTITLE), "inline": False},
                 {
                     "name": "Background Image",
-                    "value": guild_config.get("welcome_card_background_url") or "Using generated default background",
+                    "value": guild_config.get("welcome_card_background_url") or ("Stored custom image" if guild_config.get("welcome_card_background_image_data") else "Using generated default background"),
+                    "inline": False
+                },
+                {
+                    "name": "Background Storage",
+                    "value": "Durable saved copy" if guild_config.get("welcome_card_background_image_data") else "No saved copy",
                     "inline": False
                 },
                 {
