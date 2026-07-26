@@ -357,6 +357,28 @@ class Verification(commands.Cog):
         """Get the configured rules acceptance button label."""
         return guild_config.get("rules_button_label") or "Accept"
 
+    def _build_verification_context(self, member: discord.Member) -> dict:
+        """Build a shared placeholder context for verification messages."""
+        return {
+            "user": member.mention,
+            "username": member.name,
+            "display_name": member.display_name,
+            "server": member.guild.name
+        }
+
+    def _get_verification_signpost_message(self, guild_config: dict, member: discord.Member) -> Optional[str]:
+        """Render the optional post-verification signpost message."""
+        template = str(guild_config.get("verification_signpost_message") or "").strip()
+        if not template:
+            return None
+
+        context = self._build_verification_context(member)
+        try:
+            return template.format(**context)
+        except KeyError as error:
+            logger.warning("Verification signpost template missing placeholder %s; using raw template.", error.args[0])
+            return template
+
     def get_rules_accept_view(self, guild_config: dict) -> RulesAcceptView:
         """Create a rules acceptance view using the saved button label."""
         return RulesAcceptView(self, button_label=self._get_rules_button_label(guild_config))
@@ -1740,6 +1762,9 @@ class Verification(commands.Cog):
                     f"You've accepted the rules for **{guild.name}**.\n\n"
                     "I restored your saved platform identity and verified you automatically."
                 )
+                signpost_message = self._get_verification_signpost_message(guild_config, member)
+                if signpost_message:
+                    message += f"\n\n**Next Step:**\n{signpost_message}"
                 if nickname_note:
                     message += f"\n\n**Nickname Note:** {nickname_note}"
 
@@ -1780,6 +1805,9 @@ class Verification(commands.Cog):
                     f"You've accepted the rules for **{guild.name}**.\n\n"
                     "Your verification is complete and you now have access to all channels."
                 )
+            signpost_message = self._get_verification_signpost_message(guild_config, member)
+            if signpost_message:
+                success_message += f"\n\n**Next Step:**\n{signpost_message}"
 
             await self._send_interaction_embed(
                 interaction,
@@ -1868,6 +1896,9 @@ class Verification(commands.Cog):
             f"**Roles Added:** {added_names}\n"
             f"**Roles Removed:** {removed_names}"
         )
+        signpost_message = self._get_verification_signpost_message(guild_config, member)
+        if signpost_message:
+            message += f"\n\n**Next Step:**\n{signpost_message}"
         if nickname_note:
             message += f"\n**Nickname Note:** {nickname_note}"
         else:
@@ -1978,6 +2009,11 @@ class Verification(commands.Cog):
                     "inline": False
                 },
                 {
+                    "name": "Verification Signpost",
+                    "value": (guild_config.get("verification_signpost_message") or "Not set")[:250],
+                    "inline": False
+                },
+                {
                     "name": "Note",
                     "value": (
                         "There is only one saved verification configuration per server. "
@@ -2085,6 +2121,60 @@ class Verification(commands.Cog):
             ),
             ephemeral=True
         )
+
+    @app_commands.command(name="verification-signpost", description="Set or clear the optional post-verification guidance message (Admin)")
+    @app_commands.describe(
+        message="Optional message shown after verification completes",
+        channel="Optional channel to direct members toward",
+        message_link="Optional message link to include"
+    )
+    @is_admin()
+    async def verification_signpost(
+        self,
+        interaction: discord.Interaction,
+        message: Optional[str] = None,
+        channel: Optional[discord.TextChannel] = None,
+        message_link: Optional[str] = None
+    ):
+        """Configure an optional signpost shown after members finish verification."""
+        guild_config = await self.db.get_guild(interaction.guild.id)
+        if not guild_config:
+            guild_config = await self.db.create_guild(interaction.guild.id)
+
+        parts = []
+        trimmed_message = (message or "").strip()
+        trimmed_link = (message_link or "").strip()
+
+        if trimmed_message:
+            parts.append(trimmed_message)
+        if channel is not None:
+            parts.append(f"Head to {channel.mention} for the next step.")
+        if trimmed_link:
+            parts.append(f"Important message: {trimmed_link}")
+
+        signpost_value = "\n".join(parts).strip() or None
+        await self.db.update_guild(interaction.guild.id, {"verification_signpost_message": signpost_value})
+
+        if signpost_value:
+            await interaction.response.send_message(
+                embed=EmbedFactory.success(
+                    "Verification Signpost Updated",
+                    (
+                        "Members will now see this after verification:\n\n"
+                        f"{signpost_value}\n\n"
+                        "Supported placeholders: `{user}` `{username}` `{display_name}` `{server}`"
+                    )
+                ),
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                embed=EmbedFactory.success(
+                    "Verification Signpost Cleared",
+                    "Members will no longer receive an extra signpost message after verification."
+                ),
+                ephemeral=True
+            )
 
     @app_commands.command(name="verification-mode", description="Choose what happens after members click Accept (Admin)")
     @app_commands.describe(mode="Use 'button' for instant access or 'captcha' to send a DM captcha after Accept")
