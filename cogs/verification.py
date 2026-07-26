@@ -6,7 +6,7 @@ Handles user verification with multiple methods
 import base64
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urlparse
@@ -39,6 +39,7 @@ WELCOME_CARD_BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_VERIFICATION_MODE = "button"
 CAPTCHA_CODE_LENGTH = 6
 WELCOME_MEMBER_POSITION_COLLECTION = "welcome_member_positions"
+PLATFORM_IDENTITY_RETENTION = timedelta(days=7)
 VERIFICATION_PLATFORM_CHOICES = ("twitch", "youtube", "kick")
 VERIFICATION_PLATFORM_LABELS = {
     "twitch": "Twitch",
@@ -300,9 +301,11 @@ class Verification(commands.Cog):
         self.session = None
         self.bot.add_view(VerificationButton(self))
         self.bot.add_view(RulesAcceptView(self))
+        self.cleanup_platform_identity_cache.start()
 
     def cog_unload(self):
         """Cleanup resources on cog unload."""
+        self.cleanup_platform_identity_cache.cancel()
         if self.session and not self.session.closed:
             self.bot.loop.create_task(self.session.close())
 
@@ -621,9 +624,27 @@ class Verification(commands.Cog):
             user_data = await self.db.create_user(user_id, guild_id)
         return user_data
 
+    async def _clear_platform_identity(self, user_id: int, guild_id: int) -> None:
+        """Delete the stored platform identity for a single member."""
+        await self.db.update_user(
+            user_id,
+            guild_id,
+            {
+                "viewer_platform": None,
+                "viewer_platform_username": None,
+                "viewer_platform_display_name": None,
+                "viewer_platform_url": None,
+                "viewer_platform_profile_image_url": None,
+                "viewer_platform_saved_at": None,
+                "viewer_platform_expires_at": None
+            }
+        )
+
     async def _save_platform_identity(self, user_id: int, guild_id: int, profile_data: dict) -> None:
         """Persist the member's selected viewing platform identity."""
         await self._ensure_user_record(user_id, guild_id)
+        saved_at = discord.utils.utcnow()
+        expires_at = saved_at + PLATFORM_IDENTITY_RETENTION
         await self.db.update_user(
             user_id,
             guild_id,
@@ -632,13 +653,31 @@ class Verification(commands.Cog):
                 "viewer_platform_username": profile_data["username"],
                 "viewer_platform_display_name": profile_data["display_name"],
                 "viewer_platform_url": profile_data["profile_url"],
-                "viewer_platform_profile_image_url": profile_data.get("profile_image_url")
+                "viewer_platform_profile_image_url": profile_data.get("profile_image_url"),
+                "viewer_platform_saved_at": saved_at.timestamp(),
+                "viewer_platform_expires_at": expires_at.timestamp()
             }
         )
 
-    def _get_saved_platform_identity(self, user_data: Optional[dict]) -> Optional[dict]:
-        """Return a saved platform identity if present."""
+    async def _get_saved_platform_identity(self, user_data: Optional[dict]) -> Optional[dict]:
+        """Return a saved platform identity if present and not expired."""
         if not user_data:
+            return None
+        expires_at = user_data.get("viewer_platform_expires_at")
+        if not expires_at or float(expires_at) <= discord.utils.utcnow().timestamp():
+            user_id = user_data.get("user_id")
+            guild_id = user_data.get("guild_id")
+            if user_id and guild_id and any(
+                user_data.get(field)
+                for field in (
+                    "viewer_platform",
+                    "viewer_platform_username",
+                    "viewer_platform_display_name",
+                    "viewer_platform_url",
+                    "viewer_platform_profile_image_url"
+                )
+            ):
+                await self._clear_platform_identity(int(user_id), int(guild_id))
             return None
         platform = user_data.get("viewer_platform")
         username = user_data.get("viewer_platform_username")
@@ -651,6 +690,58 @@ class Verification(commands.Cog):
             "profile_url": user_data.get("viewer_platform_url") or "",
             "profile_image_url": user_data.get("viewer_platform_profile_image_url")
         }
+
+    @tasks.loop(hours=24)
+    async def cleanup_platform_identity_cache(self) -> None:
+        """Delete stored platform identities after the retention window expires."""
+        expiry_cutoff = discord.utils.utcnow().timestamp()
+        result = await self.db.db.users.update_many(
+            {
+                "viewer_platform_expires_at": {"$lte": expiry_cutoff},
+                "viewer_platform": {"$in": list(VERIFICATION_PLATFORM_CHOICES)}
+            },
+            {
+                "$set": {
+                    "viewer_platform": None,
+                    "viewer_platform_username": None,
+                    "viewer_platform_display_name": None,
+                    "viewer_platform_url": None,
+                    "viewer_platform_profile_image_url": None,
+                    "viewer_platform_saved_at": None,
+                    "viewer_platform_expires_at": None
+                }
+            }
+        )
+        if result.modified_count:
+            logger.info("Cleared %s expired verification platform identities", result.modified_count)
+
+        legacy_result = await self.db.db.users.update_many(
+            {
+                "viewer_platform": {"$in": list(VERIFICATION_PLATFORM_CHOICES)},
+                "$or": [
+                    {"viewer_platform_expires_at": {"$exists": False}},
+                    {"viewer_platform_expires_at": None}
+                ]
+            },
+            {
+                "$set": {
+                    "viewer_platform": None,
+                    "viewer_platform_username": None,
+                    "viewer_platform_display_name": None,
+                    "viewer_platform_url": None,
+                    "viewer_platform_profile_image_url": None,
+                    "viewer_platform_saved_at": None,
+                    "viewer_platform_expires_at": None
+                }
+            }
+        )
+        if legacy_result.modified_count:
+            logger.info("Cleared %s legacy verification platform identities without expiry metadata", legacy_result.modified_count)
+
+    @cleanup_platform_identity_cache.before_loop
+    async def before_cleanup_platform_identity_cache(self) -> None:
+        """Wait until the bot is ready before clearing stored identities."""
+        await self.bot.wait_until_ready()
 
     async def _update_member_nickname(self, member: discord.Member, nickname: str) -> tuple[bool, Optional[str]]:
         """Attempt to update a member's nickname to match their platform username."""
@@ -1740,7 +1831,7 @@ class Verification(commands.Cog):
 
         if source in {"rules_accept", "rules_accept_captcha"} and self._platform_link_enabled(guild_config):
             user_data = await self._ensure_user_record(member.id, guild.id)
-            saved_profile = self._get_saved_platform_identity(user_data)
+            saved_profile = await self._get_saved_platform_identity(user_data)
             if saved_profile:
                 success, roles_added, roles_removed, nickname_note = await self._apply_platform_verification(
                     member,
@@ -1982,6 +2073,7 @@ class Verification(commands.Cog):
                 {"name": "Rules Accept Flow", "value": self._get_verification_mode(guild_config), "inline": True},
                 {"name": "Rules Panel", "value": "Enabled" if guild_config.get("rules_panel_enabled", False) else "Disabled", "inline": True},
                 {"name": "Platform Link Stage", "value": "Enabled" if self._platform_link_enabled(guild_config) else "Disabled", "inline": True},
+                {"name": "Platform Save Retention", "value": "7 days", "inline": True},
                 {"name": "Verified Role", "value": verified_role.mention if verified_role else "Missing role", "inline": False},
                 {
                     "name": "Platform Roles",
