@@ -272,8 +272,8 @@ class ExclusiveRoleSelect(discord.ui.Select):
         self.cog = cog
         options = [
             discord.SelectOption(
-                label=r['label'],
-                description=f"Get the {r['label']} role",
+                label=r['role'].name,
+                description=f"Get the {r['role'].name} role",
                 value=str(r['role'].id),
                 emoji=r['emoji']
             )
@@ -308,7 +308,7 @@ class ExclusiveRoleButton(discord.ui.Button):
         self.cog = cog
         role_info = role_data[0]
         super().__init__(
-            label=role_info["label"],
+            label=role_info["role"].name,
             style=discord.ButtonStyle.primary,
             emoji=role_info["emoji"],
             custom_id=f"exclusive_role_button_{role_info['role'].id}_{token}"
@@ -332,8 +332,8 @@ class MultiRoleSelect(discord.ui.Select):
         self.cog = cog
         options = [
             discord.SelectOption(
-                label=r['label'],
-                description=f"Toggle {r['label']} role",
+                label=r['role'].name,
+                description=f"Toggle {r['role'].name} role",
                 value=str(r['role'].id),
                 emoji=r['emoji']
             )
@@ -678,7 +678,7 @@ class Roles(commands.Cog):
                     role_data.append({
                         "role": role,
                         "emoji": item.get("emoji") or "🎭",
-                        "label": item.get("label") or role.name
+                        "label": role.name
                     })
 
                 if not role_data:
