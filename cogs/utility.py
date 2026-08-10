@@ -18,6 +18,299 @@ from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
+HELP_TOPIC_CHOICES = [
+    app_commands.Choice(name="Overview", value="overview"),
+    app_commands.Choice(name="Setup", value="setup"),
+    app_commands.Choice(name="Embeds", value="embeds"),
+    app_commands.Choice(name="Verification", value="verification"),
+    app_commands.Choice(name="Roles", value="roles"),
+    app_commands.Choice(name="Tickets", value="tickets"),
+    app_commands.Choice(name="Voice", value="voice"),
+    app_commands.Choice(name="Alerts", value="alerts"),
+    app_commands.Choice(name="AI", value="ai"),
+    app_commands.Choice(name="Community", value="community"),
+    app_commands.Choice(name="Economy & Games", value="economy_games"),
+    app_commands.Choice(name="Music", value="music"),
+    app_commands.Choice(name="Moderation", value="moderation"),
+    app_commands.Choice(name="Utilities", value="utilities"),
+]
+
+HELP_TOPIC_LAYOUTS = {
+    "overview": {
+        "title": "📘 Logiq Help",
+        "description": (
+            "Quick admin overview for the most important setup and maintenance commands.\n"
+            "Use `/help topic:<section>` to jump into a specific area."
+        ),
+        "fields": [
+            (
+                "🚀 Getting Started",
+                ["reload", "sync", "modules", "config"]
+            ),
+            (
+                "🔐 Core Setup",
+                ["embed_rules", "verification-role", "verification-mode", "welcome-card-config", "ticket-setup"]
+            ),
+            (
+                "📣 Alerts & Diagnostics",
+                ["alert add", "alert edit", "alert debug", "alert eventsub-sync", "alert kick-sync"]
+            ),
+            (
+                "🎨 Panels & Embeds",
+                ["embed_create", "embed_edit", "embed_rules_edit", "create-role-menu", "create-color-panel", "repair-role-menu"]
+            ),
+            (
+                "🧩 Other Areas",
+                ["ticket-panel", "setup-tempvoice", "ask", "play"]
+            ),
+        ],
+    },
+    "setup": {
+        "title": "🛠️ Logiq Help - Setup",
+        "description": "Use these commands when bringing a new server online or reworking the core setup.",
+        "fields": [
+            (
+                "🔐 Verification & Welcome",
+                [
+                    "embed_rules",
+                    "verification-role",
+                    "verification-mode",
+                    "verification-platform-toggle",
+                    "verification-signpost",
+                    "welcome-card-config",
+                    "welcome-card-preview",
+                    "send-verification",
+                ]
+            ),
+            (
+                "🎫 Support & Logging",
+                ["ticket-setup", "ticket-panel", "setlogchannel", "auditlog-status"]
+            ),
+            (
+                "📊 Stats & Server Channels",
+                ["serverstats-channels setup", "serverstats-channels refresh", "serverstats-channels remove", "setlevelchannel", "birthday-config"]
+            ),
+        ],
+    },
+    "embeds": {
+        "title": "🧱 Logiq Help - Embeds",
+        "description": "Commands for creating, editing, and maintaining custom embed panels without recreating them from scratch.",
+        "fields": [
+            (
+                "✍️ Custom Embeds",
+                ["embed_create", "embed_edit"]
+            ),
+            (
+                "📜 Rules Panels",
+                ["embed_rules", "embed_rules_edit"]
+            ),
+            (
+                "🔗 Common Pairings",
+                ["verification-role", "verification-signpost", "send-verification"]
+            ),
+        ],
+    },
+    "verification": {
+        "title": "🔐 Logiq Help - Verification",
+        "description": "Everything related to rules panels, verified roles, captcha mode, platform linking, and welcome cards.",
+        "fields": [
+            (
+                "📋 Rules & Access",
+                [
+                    "embed_rules",
+                    "embed_rules_edit",
+                    "verification-role",
+                    "verification-status",
+                    "verification-disable",
+                    "send-verification",
+                ]
+            ),
+            (
+                "🧩 Verification Flow",
+                [
+                    "verification-mode",
+                    "verification-platform-toggle",
+                    "verification-platform-role",
+                    "verification-platform-link",
+                    "verification-signpost",
+                ]
+            ),
+            (
+                "🖼️ Welcome Experience",
+                ["welcome-card-config", "welcome-card-preview", "set-welcome-message"]
+            ),
+        ],
+    },
+    "roles": {
+        "title": "🎭 Logiq Help - Roles",
+        "description": "Commands for role menus, colour panels, one-off assignments, and bulk role changes.",
+        "fields": [
+            (
+                "🧷 Self-Assign Panels",
+                ["create-role-menu", "create-color-panel", "repair-role-menu"]
+            ),
+            (
+                "👤 Individual Role Changes",
+                ["addrole", "removerole"]
+            ),
+            (
+                "👥 Bulk Role Changes",
+                ["massrole-add", "massrole-remove", "massrole-add-filter", "massrole-remove-filter"]
+            ),
+        ],
+    },
+    "tickets": {
+        "title": "🎫 Logiq Help - Tickets",
+        "description": "Support ticket configuration, panel deployment, and active ticket management.",
+        "fields": [
+            (
+                "🛠️ Ticket Setup",
+                ["ticket-setup", "ticket-panel"]
+            ),
+            (
+                "📂 Ticket Management",
+                ["close-ticket", "tickets"]
+            ),
+            (
+                "🧾 Related Tools",
+                ["setlogchannel", "config"]
+            ),
+        ],
+    },
+    "voice": {
+        "title": "🎙️ Logiq Help - Temp Voice",
+        "description": "Temporary voice-channel setup plus the member controls for locking, resizing, and claiming channels.",
+        "fields": [
+            (
+                "🛠️ Setup",
+                ["setup-tempvoice"]
+            ),
+            (
+                "🔒 Controls",
+                ["voice-lock", "voice-unlock", "voice-limit", "voice-rename", "voice-claim"]
+            ),
+        ],
+    },
+    "alerts": {
+        "title": "📣 Logiq Help - Alerts",
+        "description": "Commands for Twitch, Kick, and YouTube alerts plus diagnostics and webhook sync tools.",
+        "fields": [
+            (
+                "📡 Alert Management",
+                ["alert add", "alert edit", "alert remove", "alert list", "alert test", "alert run"]
+            ),
+            (
+                "🩺 Diagnostics",
+                ["alert debug", "alert eventsub-sync", "alert kick-sync"]
+            ),
+            (
+                "🔗 YouTube Owner Flow",
+                ["alert youtube-oauth-connect", "alert youtube-oauth-disconnect"]
+            ),
+        ],
+    },
+    "ai": {
+        "title": "🤖 Logiq Help - AI",
+        "description": "AI chat, summaries, and conversation resets. These commands need the AI module enabled and an API key configured.",
+        "fields": [
+            (
+                "💬 AI Commands",
+                ["ask", "summarize", "clear-conversation"]
+            ),
+            (
+                "🧾 Related Admin Checks",
+                ["modules", "reload", "sync"]
+            ),
+        ],
+    },
+    "community": {
+        "title": "🌍 Logiq Help - Community",
+        "description": "Server growth, birthdays, analytics, leveling, time lookups, and auto-updating stat channels.",
+        "fields": [
+            (
+                "📈 Analytics & Activity",
+                ["analytics", "activity", "serverstats"]
+            ),
+            (
+                "🎂 Birthdays & Time",
+                ["birthday-set", "birthday-remove", "birthday-config", "birthday-list", "birthday-test", "time-country"]
+            ),
+            (
+                "📊 Progress & Stats Channels",
+                ["setlevelchannel", "setlevel", "resetlevels", "serverstats-channels setup", "serverstats-channels refresh", "serverstats-channels remove"]
+            ),
+        ],
+    },
+    "economy_games": {
+        "title": "🎮 Logiq Help - Economy & Games",
+        "description": "Economy, casual game commands, leaderboards, and giveaway management.",
+        "fields": [
+            (
+                "💎 Economy",
+                ["daily", "give", "coinflip-bet", "shop", "addbalance"]
+            ),
+            (
+                "🏆 Games & Progress",
+                ["setup-game-panel", "rank", "balance", "leaderboard"]
+            ),
+            (
+                "🎉 Giveaways",
+                ["giveaway", "gend", "greroll"]
+            ),
+        ],
+    },
+    "music": {
+        "title": "🎵 Logiq Help - Music",
+        "description": "Music playback commands for servers where the music module is still enabled.",
+        "fields": [
+            (
+                "▶️ Playback",
+                ["play", "join", "leave", "queue", "skip", "pause", "resume", "nowplaying"]
+            ),
+            (
+                "🎚️ Control",
+                ["volume"]
+            ),
+        ],
+    },
+    "moderation": {
+        "title": "🛡️ Logiq Help - Moderation",
+        "description": "Commands for moderation actions, channel controls, and moderation visibility.",
+        "fields": [
+            (
+                "🔨 Member Actions",
+                ["warn", "warnings", "timeout", "kick", "ban", "unban", "nickname"]
+            ),
+            (
+                "💬 Channel Controls",
+                ["clear", "purge", "slowmode", "lock", "unlock"]
+            ),
+            (
+                "🧾 Visibility",
+                ["setlogchannel", "auditlog-status", "config"]
+            ),
+        ],
+    },
+    "utilities": {
+        "title": "🧰 Logiq Help - Utilities",
+        "description": "General utility, info, analytics, birthday, and time tools that admins commonly use.",
+        "fields": [
+            (
+                "ℹ️ Info & Utility",
+                ["botinfo", "serverstats", "userinfo", "avatar", "poll", "remind", "time-country"]
+            ),
+            (
+                "🎂 Birthday Tools",
+                ["birthday-set", "birthday-remove", "birthday-config", "birthday-list", "birthday-test"]
+            ),
+            (
+                "📈 Activity & Progress",
+                ["analytics", "activity", "setlevelchannel"]
+            ),
+        ],
+    },
+}
+
 
 class PollView(discord.ui.View):
     """Interactive poll view"""
@@ -97,6 +390,68 @@ class Utility(commands.Cog):
         """Cleanup on cog unload"""
         self.reminders_task.cancel()
 
+    def _flatten_app_commands(self, commands_list: list, prefix: str = "") -> dict[str, str]:
+        """Return a mapping of slash-command paths to their descriptions."""
+        flattened: dict[str, str] = {}
+        for command in commands_list:
+            full_name = f"{prefix}{command.name}"
+            description = getattr(command, "description", None) or "No description provided."
+            flattened[full_name] = description
+
+            if isinstance(command, app_commands.Group):
+                flattened.update(self._flatten_app_commands(list(command.commands), prefix=f"{full_name} "))
+
+        return flattened
+
+    def _get_available_command_map(self, interaction: discord.Interaction) -> dict[str, str]:
+        """Collect the currently registered slash commands for this scope."""
+        tree_commands = self.bot.tree.get_commands(guild=interaction.guild)
+        return self._flatten_app_commands(list(tree_commands))
+
+    def _format_help_section(self, command_map: dict[str, str], command_names: list[str]) -> str:
+        """Format help lines for the commands that currently exist."""
+        lines = []
+        for command_name in command_names:
+            description = command_map.get(command_name)
+            if not description:
+                continue
+            lines.append(f"`/{command_name}` - {description}")
+        return "\n".join(lines) or "No live commands in this section right now."
+
+    def _build_help_embed(self, interaction: discord.Interaction, topic: str) -> discord.Embed:
+        """Build the requested help embed."""
+        topic_config = HELP_TOPIC_LAYOUTS.get(topic, HELP_TOPIC_LAYOUTS["overview"])
+        command_map = self._get_available_command_map(interaction)
+        embed = EmbedFactory.create(
+            title=topic_config["title"],
+            description=topic_config["description"],
+            color=EmbedColor.INFO,
+            footer="Grouped commands use a space, for example: /alert add"
+        )
+
+        for field_name, command_names in topic_config["fields"]:
+            embed.add_field(
+                name=field_name,
+                value=self._format_help_section(command_map, command_names),
+                inline=False
+            )
+
+        total_live_commands = len(
+            [
+                name for name in command_map
+                if " " not in name or name.count(" ") == 1 or name.startswith("alert ") or name.startswith("serverstats-channels ")
+            ]
+        )
+        embed.add_field(
+            name="🧭 Tip",
+            value=(
+                f"This deployment currently exposes **{total_live_commands}** slash command entries.\n"
+                "Use `/help topic:<section>` to narrow the list when you need something specific."
+            ),
+            inline=False
+        )
+        return embed
+
     async def check_reminders(self):
         """Background task to check for due reminders"""
         await self.bot.wait_until_ready()
@@ -124,6 +479,15 @@ class Utility(commands.Cog):
             except Exception as e:
                 logger.error(f"Error in reminder checker: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    @app_commands.command(name="help", description="View a guide to Logiq commands and setup")
+    @app_commands.describe(topic="Optional help section to open directly")
+    @app_commands.choices(topic=HELP_TOPIC_CHOICES)
+    async def help_command(self, interaction: discord.Interaction, topic: Optional[app_commands.Choice[str]] = None):
+        """Show a slash-command help guide."""
+        selected_topic = topic.value if topic else "overview"
+        embed = self._build_help_embed(interaction, selected_topic)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="poll", description="Create a poll (Admin)")
     @app_commands.describe(
