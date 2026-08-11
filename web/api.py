@@ -4,7 +4,9 @@ REST API endpoints for bot statistics and management
 """
 
 from datetime import datetime, timedelta, timezone
+from html import escape
 import json
+from pathlib import Path
 import re
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Response
@@ -20,6 +22,9 @@ TWITCH_EVENTSUB_PATH = "/webhooks/twitch/eventsub"
 KICK_EVENTS_PATH = "/webhooks/kick/events"
 YOUTUBE_OAUTH_CALLBACK_PATH = "/oauth/youtube/callback"
 TIKTOK_OAUTH_CALLBACK_PATH = "/oauth/tiktok/callback"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TERMS_PATH = PROJECT_ROOT / "TERMS.md"
+PRIVACY_PATH = PROJECT_ROOT / "PRIVACY.md"
 
 
 def parse_rfc3339_timestamp(timestamp: str) -> datetime | None:
@@ -38,6 +43,132 @@ def parse_rfc3339_timestamp(timestamp: str) -> datetime | None:
         return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def render_markdown_document(title: str, markdown_text: str) -> str:
+    """Render a lightweight Markdown document as simple HTML."""
+    lines = markdown_text.splitlines()
+    html_parts: list[str] = []
+    in_list = False
+    in_code = False
+
+    def close_list() -> None:
+        nonlocal in_list
+        if in_list:
+            html_parts.append("</ul>")
+            in_list = False
+
+    def close_code() -> None:
+        nonlocal in_code
+        if in_code:
+            html_parts.append("</code></pre>")
+            in_code = False
+
+    for raw_line in lines:
+        line = raw_line.rstrip("\n")
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            close_list()
+            if in_code:
+                close_code()
+            else:
+                html_parts.append("<pre><code>")
+                in_code = True
+            continue
+
+        if in_code:
+            html_parts.append(f"{escape(line)}\n")
+            continue
+
+        if not stripped:
+            close_list()
+            html_parts.append("<p></p>")
+            continue
+
+        if stripped.startswith("# "):
+            close_list()
+            html_parts.append(f"<h1>{escape(stripped[2:])}</h1>")
+            continue
+        if stripped.startswith("## "):
+            close_list()
+            html_parts.append(f"<h2>{escape(stripped[3:])}</h2>")
+            continue
+        if stripped.startswith("### "):
+            close_list()
+            html_parts.append(f"<h3>{escape(stripped[4:])}</h3>")
+            continue
+        if stripped.startswith("- "):
+            if not in_list:
+                html_parts.append("<ul>")
+                in_list = True
+            html_parts.append(f"<li>{escape(stripped[2:])}</li>")
+            continue
+
+        close_list()
+        html_parts.append(f"<p>{escape(stripped)}</p>")
+
+    close_list()
+    close_code()
+
+    body = "\n".join(html_parts)
+    return f"""
+    <html lang="en">
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>{escape(title)}</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    max-width: 860px;
+                    margin: 40px auto;
+                    padding: 0 20px 40px;
+                    line-height: 1.65;
+                    color: #1f2937;
+                    background: #ffffff;
+                }}
+                h1, h2, h3 {{
+                    color: #111827;
+                }}
+                h1 {{
+                    margin-bottom: 8px;
+                }}
+                h2 {{
+                    margin-top: 32px;
+                }}
+                p {{
+                    margin: 14px 0;
+                }}
+                ul {{
+                    margin: 12px 0 12px 22px;
+                }}
+                li {{
+                    margin: 8px 0;
+                }}
+                pre {{
+                    background: #f3f4f6;
+                    padding: 16px;
+                    overflow-x: auto;
+                    border-radius: 8px;
+                }}
+                code {{
+                    font-family: Menlo, Monaco, Consolas, monospace;
+                }}
+            </style>
+        </head>
+        <body>
+            {body}
+        </body>
+    </html>
+    """
+
+
+def load_policy_html(path: Path, title: str) -> str:
+    """Load a Markdown policy file and render it as HTML."""
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"{title} document not found")
+    return render_markdown_document(title, path.read_text(encoding="utf-8"))
 
 
 def create_app(bot) -> FastAPI:
@@ -88,6 +219,16 @@ def create_app(bot) -> FastAPI:
                 return f.read()
         # Return fallback if template doesn't exist
         return "<h1>Admin Dashboard - Template not found</h1>"
+
+    @app.get("/terms", response_class=HTMLResponse)
+    async def terms_of_service():
+        """Public Terms of Service page for platform review and general reference."""
+        return load_policy_html(TERMS_PATH, "Logiq Fork Terms of Service")
+
+    @app.get("/privacy", response_class=HTMLResponse)
+    async def privacy_policy():
+        """Public Privacy Policy page for platform review and general reference."""
+        return load_policy_html(PRIVACY_PATH, "Logiq Fork Privacy Policy")
 
     @app.get("/stats")
     async def get_stats():
