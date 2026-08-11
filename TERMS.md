@@ -8,6 +8,8 @@ These Terms of Service apply to this forked and modified deployment of **Logiq**
 
 This fork is offered as a **free, non-commercial community tool** for Discord server management, creator-community automation, alerts, onboarding, and related utility features.
 
+By installing the bot in a Discord server, using its slash commands or interactive features, or using any related web callback or connection flow, you agree to these Terms and to the accompanying Privacy Policy. If you do not agree, do not use this forked deployment.
+
 These Terms apply to your use of:
 
 - this forked bot deployment
@@ -38,6 +40,7 @@ If the operator materially changes how the bot is offered, these Terms may be up
 
 You may use the bot only if:
 
+- you are at least **13 years old**, or the minimum age required to use Discord in your country, whichever is higher
 - you comply with Discord's Terms of Service and Community Guidelines
 - you comply with any applicable platform rules for Twitch, YouTube, Kick, TikTok, Instagram, or other connected services
 - you do not use the bot for unlawful, abusive, fraudulent, harassing, or harmful conduct
@@ -86,6 +89,31 @@ Those services are controlled by their own providers and may change, fail, rate-
 
 The operator of this fork is not responsible for outages, delays, revoked credentials, API changes, webhook failures, review denials, or data limitations caused by third-party services.
 
+Use of platform-specific features may also be subject to the relevant platform's own terms, developer rules, and privacy notices. For example, if you use Twitch, YouTube, Kick, TikTok, or Instagram integrations through the bot, you are responsible for complying with the terms that apply to those services.
+
+This fork is not operated by, endorsed by, or affiliated with Discord, Twitch, YouTube, Google, Kick, TikTok, Instagram, OpenAI, Anthropic, or the original upstream project owners except as permitted by applicable open-source licensing.
+
+### Platform Terms and Policy Links
+
+Where applicable, the following official platform policies may also apply to the services used through this bot:
+
+- Discord Terms of Service: [https://discord.com/terms](https://discord.com/terms)
+- Discord Privacy Policy: [https://discord.com/privacy-policy](https://discord.com/privacy-policy)
+- Discord Developer Terms of Service: [https://support-dev.discord.com/hc/en-us/articles/8562894815383-Discord-Developer-Terms-of-Service](https://support-dev.discord.com/hc/en-us/articles/8562894815383-Discord-Developer-Terms-of-Service)
+- Twitch Terms of Service: [https://legal.twitch.com/en/legal/terms-of-service/](https://legal.twitch.com/en/legal/terms-of-service/)
+- Twitch Privacy Notice: [https://www.twitch.tv/p/en/legal/privacy-notice/](https://www.twitch.tv/p/en/legal/privacy-notice/)
+- YouTube Terms of Service: [https://www.youtube.com/t/terms](https://www.youtube.com/t/terms)
+- Google Privacy Policy: [https://policies.google.com/privacy](https://policies.google.com/privacy)
+- YouTube API Services Terms of Service: [https://developers.google.com/youtube/terms/api-services-terms-of-service](https://developers.google.com/youtube/terms/api-services-terms-of-service)
+- YouTube Developer Policies: [https://developers.google.com/youtube/terms/developer-policies](https://developers.google.com/youtube/terms/developer-policies)
+- Kick Terms of Service: [https://kick.com/terms-of-service](https://kick.com/terms-of-service)
+- Kick Privacy Policy: [https://kick.com/privacy-policy](https://kick.com/privacy-policy)
+- TikTok Terms of Service: [https://www.tiktok.com/legal/page/us/terms-of-service/en](https://www.tiktok.com/legal/page/us/terms-of-service/en)
+- TikTok Privacy Policy: [https://www.tiktok.com/legal/page/us/privacy-policy/en](https://www.tiktok.com/legal/page/us/privacy-policy/en)
+- TikTok Developer Guidelines and Policies: [https://developers.tiktok.com/doc/our-guidelines-developer-guidelines/](https://developers.tiktok.com/doc/our-guidelines-developer-guidelines/)
+- Instagram Terms of Use: [https://www.facebook.com/help/instagram/581066165581870](https://www.facebook.com/help/instagram/581066165581870)
+- Meta Privacy Policy: [https://www.facebook.com/policy](https://www.facebook.com/policy)
+
 ## 7. No Warranty
 
 This bot is provided on an **"as is"** and **"as available"** basis.
@@ -128,6 +156,8 @@ Server administrators may also remove the bot from their servers at any time.
 Use of the bot is also subject to the accompanying Privacy Policy for this fork.
 
 The Privacy Policy explains, at a high level, what operational data the bot stores and why.
+
+Removing the bot from a Discord server stops future operation in that server, but already stored operational records may continue to exist until deleted, overwritten, or cleaned up in the ordinary course described in the Privacy Policy.
 
 ## 11. Changes to These Terms
 
