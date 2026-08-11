@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Logiq - Enhanced</title>
+    <style>
+        :root {
+            --bg: #08111f;
+            --panel: #0b1627;
+            --panel-border: rgba(144, 202, 249, 0.22);
+            --text: #eff6ff;
+            --muted: #bdd3ef;
+            --accent: #6ec6ff;
+            --accent-strong: #1ea7ff;
+            --accent-soft: rgba(30, 167, 255, 0.18);
+            --card: #0d192b;
+            --shadow: 0 30px 90px rgba(0, 0, 0, 0.35);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top, rgba(110, 198, 255, 0.14), transparent 30%),
+                linear-gradient(180deg, #07111d 0%, #0b1627 100%);
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        body::before,
+        body::after {
+            content: "";
+            position: fixed;
+            top: 0;
+            bottom: 0;
+            width: min(18vw, 220px);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        body::before {
+            left: 0;
+            background:
+                linear-gradient(180deg, rgba(42, 162, 255, 0.2), rgba(42, 162, 255, 0.04)),
+                radial-gradient(circle at 20% 20%, rgba(144, 202, 249, 0.4), transparent 45%);
+            border-right: 1px solid rgba(110, 198, 255, 0.15);
+        }
+
+        body::after {
+            right: 0;
+            background:
+                linear-gradient(180deg, rgba(42, 162, 255, 0.06), rgba(42, 162, 255, 0.2)),
+                radial-gradient(circle at 80% 80%, rgba(144, 202, 249, 0.32), transparent 42%);
+            border-left: 1px solid rgba(110, 198, 255, 0.15);
+        }
+
+        .shell {
+            position: relative;
+            z-index: 1;
+            width: min(1240px, 100%);
+            margin: 0 auto;
+            padding:
+                32px
+                clamp(72px, 8vw, 120px)
+                56px;
+        }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+            flex-wrap: wrap;
+            margin-bottom: 28px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .brand-mark {
+            width: 52px;
+            height: 52px;
+            border-radius: 16px;
+            background:
+                linear-gradient(145deg, rgba(110, 198, 255, 0.95), rgba(30, 167, 255, 0.75));
+            box-shadow: inset 0 0 24px rgba(255, 255, 255, 0.18);
+            display: grid;
+            place-items: center;
+            color: #04111d;
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        .brand-copy h1 {
+            margin: 0;
+            font-size: clamp(2rem, 4vw, 3.5rem);
+            line-height: 0.95;
+            letter-spacing: -0.04em;
+        }
+
+        .brand-copy p {
+            margin: 8px 0 0;
+            color: var(--muted);
+            font-size: 1rem;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            margin-left: auto;
+            max-width: min(100%, 720px);
+        }
+
+        .nav-links a,
+        .cta-row a,
+        .footer-links a {
+            color: var(--text);
+            text-decoration: none;
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            border: 1px solid var(--panel-border);
+            background: rgba(12, 25, 44, 0.72);
+            white-space: nowrap;
+            transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+        }
+
+        .pill:hover,
+        .cta:hover,
+        .footer-links a:hover {
+            transform: translateY(-1px);
+            border-color: rgba(110, 198, 255, 0.45);
+        }
+
+        .hero {
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            border-radius: 28px;
+            box-shadow: var(--shadow);
+            padding: clamp(24px, 4vw, 40px);
+            display: grid;
+            grid-template-columns: minmax(0, 1.4fr) minmax(300px, 0.9fr);
+            gap: 28px;
+            backdrop-filter: blur(10px);
+            position: relative;
+            z-index: 2;
+            margin-bottom: 42px;
+            overflow: hidden;
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: var(--accent-soft);
+            color: var(--accent);
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            font-size: 0.78rem;
+        }
+
+        .hero h2 {
+            margin: 18px 0 14px;
+            font-size: clamp(2rem, 4vw, 3.4rem);
+            line-height: 0.98;
+            letter-spacing: -0.04em;
+        }
+
+        .hero p {
+            margin: 0;
+            color: var(--muted);
+            font-size: 1.05rem;
+            line-height: 1.65;
+            max-width: 62ch;
+        }
+
+        .cta-row {
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+            margin-top: 26px;
+        }
+
+        .cta {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 176px;
+            padding: 13px 18px;
+            border-radius: 16px;
+            border: 1px solid var(--panel-border);
+            background: rgba(12, 25, 44, 0.88);
+            font-weight: 700;
+            transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+        }
+
+        .cta.primary {
+            background: linear-gradient(135deg, rgba(30, 167, 255, 0.28), rgba(110, 198, 255, 0.16));
+            border-color: rgba(110, 198, 255, 0.4);
+        }
+
+        .panel-stack {
+            display: grid;
+            gap: 16px;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid rgba(110, 198, 255, 0.16);
+            border-radius: 20px;
+            padding: 18px 18px 16px;
+        }
+
+        .card h3,
+        .section h3 {
+            margin: 0 0 10px;
+            font-size: 1.05rem;
+            letter-spacing: 0.01em;
+        }
+
+        .card p,
+        .card li,
+        .section li,
+        .section p,
+        .footer-note {
+            color: var(--muted);
+            line-height: 1.6;
+        }
+
+        .card ul,
+        .section ul {
+            padding-left: 18px;
+            margin: 0;
+        }
+
+        .sections {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 22px;
+            margin-top: 0;
+            position: relative;
+            z-index: 1;
+        }
+
+        .section {
+            background: rgba(8, 18, 31, 0.68);
+            border: 1px solid rgba(110, 198, 255, 0.14);
+            border-radius: 22px;
+            padding: 20px;
+        }
+
+        .footer {
+            margin-top: 22px;
+            padding: 20px 4px 0;
+            display: flex;
+            justify-content: space-between;
+            gap: 18px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+        }
+
+        .footer-links {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .footer-links a {
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        .repo-link {
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        @media (max-width: 980px) {
+            body::before,
+            body::after {
+                width: 48px;
+            }
+
+            .hero,
+            .sections {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 640px) {
+            .shell {
+                width: 100%;
+                padding:
+                    18px
+                    18px
+                    40px;
+            }
+
+            .topbar {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .brand {
+                align-items: flex-start;
+            }
+
+            .brand-mark {
+                width: 46px;
+                height: 46px;
+                border-radius: 14px;
+                font-size: 24px;
+            }
+
+            .hero {
+                padding: 22px;
+                border-radius: 22px;
+                margin-bottom: 28px;
+            }
+
+            .cta-row,
+            .nav-links {
+                width: 100%;
+            }
+
+            .nav-links {
+                justify-content: flex-start;
+                margin-left: 0;
+            }
+
+            .cta {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main class="shell">
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-mark">L</div>
+                <div class="brand-copy">
+                    <h1>Logiq - Enhanced</h1>
+                    <p>Free, non-commercial Discord tooling for creator communities.</p>
+                </div>
+            </div>
+            <nav class="nav-links" aria-label="Quick links">
+                <a class="pill" href="/terms">Terms of Service</a>
+                <a class="pill" href="/privacy">Privacy Policy</a>
+                <a class="pill" href="https://github.com/blemondisberi-jpg/Logiq" target="_blank" rel="noopener noreferrer">GitHub Repository</a>
+            </nav>
+        </header>
+
+        <section class="hero">
+            <div>
+                <span class="eyebrow">Public App Overview</span>
+                <h2>Community automation, onboarding, moderation, and creator alerts in one bot.</h2>
+                <p>
+                    Logiq - Enhanced is a forked and modified Discord bot deployment built for creator-led communities.
+                    It helps server staff manage rules acceptance, role assignment, welcome flows, moderation utilities,
+                    support systems, social alerts, and server automation across supported platforms.
+                </p>
+                <div class="cta-row">
+                    <a class="cta primary" href="/terms">Read Terms of Service</a>
+                    <a class="cta" href="/privacy">Read Privacy Policy</a>
+                </div>
+            </div>
+
+            <div class="panel-stack">
+                <article class="card">
+                    <h3>Supported Integrations</h3>
+                    <ul>
+                        <li>Discord server automation and onboarding</li>
+                        <li>Twitch and Kick live alerts</li>
+                        <li>YouTube, TikTok, and Instagram alert flows</li>
+                        <li>Optional AI-assisted tools when separately configured</li>
+                    </ul>
+                </article>
+                <article class="card">
+                    <h3>Platform Authorization</h3>
+                    <p>
+                        Some features require the owner of a connected social account to authorize access through the
+                        relevant platform's official OAuth or webhook flow. The bot does not present itself as an official
+                        product of any connected platform.
+                    </p>
+                </article>
+                <article class="card">
+                    <h3>Operator Contact</h3>
+                    <p>
+                        Operator: Blemondisberi<br>
+                        Contact: <a class="repo-link" href="mailto:blemondisberi@gmail.com">blemondisberi@gmail.com</a><br>
+                        Project: <a class="repo-link" href="https://github.com/blemondisberi-jpg/Logiq" target="_blank" rel="noopener noreferrer">blemondisberi-jpg/Logiq</a>
+                    </p>
+                </article>
+            </div>
+        </section>
+
+        <section class="sections" aria-label="Feature summary">
+            <article class="section">
+                <h3>Core Use Cases</h3>
+                <ul>
+                    <li>Verification and rules acceptance</li>
+                    <li>Role menus and onboarding paths</li>
+                    <li>Welcome cards and community setup tools</li>
+                    <li>Admin-facing moderation and utility helpers</li>
+                </ul>
+            </article>
+
+            <article class="section">
+                <h3>Alert Coverage</h3>
+                <ul>
+                    <li>Live notifications for supported streaming platforms</li>
+                    <li>Post alerts where platform support is available</li>
+                    <li>Configurable alert text, embeds, and destinations</li>
+                    <li>Debug and sync tooling for server administrators</li>
+                </ul>
+            </article>
+
+            <article class="section">
+                <h3>Legal and Data Notes</h3>
+                <p>
+                    This deployment is a free, forked community tool. Information about data handling, feature behavior,
+                    and platform-specific processing is documented in the linked legal pages.
+                </p>
+            </article>
+        </section>
+
+        <footer class="footer">
+            <p class="footer-note">
+                This deployment is a fork of the original open-source Logiq project and is operated independently as a
+                non-commercial community tool.
+            </p>
+            <div class="footer-links">
+                <a href="/terms">Terms of Service</a>
+                <a href="/privacy">Privacy Policy</a>
+            </div>
+        </footer>
+    </main>
+</body>
+</html>
