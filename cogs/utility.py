@@ -405,8 +405,18 @@ class Utility(commands.Cog):
 
     def _get_available_command_map(self, interaction: discord.Interaction) -> dict[str, str]:
         """Collect the currently registered slash commands for this scope."""
-        tree_commands = self.bot.tree.get_commands(guild=interaction.guild)
-        return self._flatten_app_commands(list(tree_commands))
+        command_map: dict[str, str] = {}
+
+        # Global commands are the normal case for this deployment, so include them first.
+        global_commands = list(self.bot.tree.get_commands())
+        command_map.update(self._flatten_app_commands(global_commands))
+
+        # If any guild-specific overrides exist, layer them on top.
+        if interaction.guild is not None:
+            guild_commands = list(self.bot.tree.get_commands(guild=interaction.guild))
+            command_map.update(self._flatten_app_commands(guild_commands))
+
+        return command_map
 
     def _format_help_section(self, command_map: dict[str, str], command_names: list[str]) -> str:
         """Format help lines for the commands that currently exist."""
