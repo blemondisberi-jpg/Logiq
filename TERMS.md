@@ -1,10 +1,10 @@
-# Logiq Fork Terms of Service
+# Logiq - Enhanced Terms of Service
 
 Last updated: August 11, 2026
 
 ## 1. Overview
 
-These Terms of Service apply to this forked and modified deployment of **Logiq**, a free and open-source Discord bot originally based on the Logiq project published under the MIT License.
+These Terms of Service apply to **Logiq - Enhanced**, a forked and modified deployment of the Logiq open-source Discord bot project originally published under the MIT License.
 
 This fork is offered as a **free, non-commercial community tool** for Discord server management, creator-community automation, alerts, onboarding, and related utility features.
 

@@ -37,7 +37,7 @@ HELP_TOPIC_CHOICES = [
 
 HELP_TOPIC_LAYOUTS = {
     "overview": {
-        "title": "📘 Logiq Help",
+        "title": "📘 Logiq - Enhanced Help",
         "description": (
             "Quick admin overview for the most important setup and maintenance commands.\n"
             "Use `/help topic:<section>` to jump into a specific area."
@@ -66,7 +66,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "setup": {
-        "title": "🛠️ Logiq Help - Setup",
+        "title": "🛠️ Logiq - Enhanced Help - Setup",
         "description": "Use these commands when bringing a new server online or reworking the core setup.",
         "fields": [
             (
@@ -93,7 +93,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "embeds": {
-        "title": "🧱 Logiq Help - Embeds",
+        "title": "🧱 Logiq - Enhanced Help - Embeds",
         "description": "Commands for creating, editing, and maintaining custom embed panels without recreating them from scratch.",
         "fields": [
             (
@@ -111,7 +111,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "verification": {
-        "title": "🔐 Logiq Help - Verification",
+        "title": "🔐 Logiq - Enhanced Help - Verification",
         "description": "Everything related to rules panels, verified roles, captcha mode, platform linking, and welcome cards.",
         "fields": [
             (
@@ -142,7 +142,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "roles": {
-        "title": "🎭 Logiq Help - Roles",
+        "title": "🎭 Logiq - Enhanced Help - Roles",
         "description": "Commands for role menus, colour panels, one-off assignments, and bulk role changes.",
         "fields": [
             (
@@ -160,7 +160,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "tickets": {
-        "title": "🎫 Logiq Help - Tickets",
+        "title": "🎫 Logiq - Enhanced Help - Tickets",
         "description": "Support ticket configuration, panel deployment, and active ticket management.",
         "fields": [
             (
@@ -178,7 +178,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "voice": {
-        "title": "🎙️ Logiq Help - Temp Voice",
+        "title": "🎙️ Logiq - Enhanced Help - Temp Voice",
         "description": "Temporary voice-channel setup plus the member controls for locking, resizing, and claiming channels.",
         "fields": [
             (
@@ -192,7 +192,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "alerts": {
-        "title": "📣 Logiq Help - Alerts",
+        "title": "📣 Logiq - Enhanced Help - Alerts",
         "description": "Commands for Twitch, Kick, and YouTube alerts plus diagnostics and webhook sync tools.",
         "fields": [
             (
@@ -210,7 +210,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "ai": {
-        "title": "🤖 Logiq Help - AI",
+        "title": "🤖 Logiq - Enhanced Help - AI",
         "description": "AI chat, summaries, and conversation resets. These commands need the AI module enabled and an API key configured.",
         "fields": [
             (
@@ -224,7 +224,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "community": {
-        "title": "🌍 Logiq Help - Community",
+        "title": "🌍 Logiq - Enhanced Help - Community",
         "description": "Server growth, birthdays, analytics, leveling, time lookups, and auto-updating stat channels.",
         "fields": [
             (
@@ -242,7 +242,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "economy_games": {
-        "title": "🎮 Logiq Help - Economy & Games",
+        "title": "🎮 Logiq - Enhanced Help - Economy & Games",
         "description": "Economy, casual game commands, leaderboards, and giveaway management.",
         "fields": [
             (
@@ -260,7 +260,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "music": {
-        "title": "🎵 Logiq Help - Music",
+        "title": "🎵 Logiq - Enhanced Help - Music",
         "description": "Music playback commands for servers where the music module is still enabled.",
         "fields": [
             (
@@ -274,7 +274,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "moderation": {
-        "title": "🛡️ Logiq Help - Moderation",
+        "title": "🛡️ Logiq - Enhanced Help - Moderation",
         "description": "Commands for moderation actions, channel controls, and moderation visibility.",
         "fields": [
             (
@@ -292,7 +292,7 @@ HELP_TOPIC_LAYOUTS = {
         ],
     },
     "utilities": {
-        "title": "🧰 Logiq Help - Utilities",
+        "title": "🧰 Logiq - Enhanced Help - Utilities",
         "description": "General utility, info, analytics, birthday, and time tools that admins commonly use.",
         "fields": [
             (
@@ -490,7 +490,7 @@ class Utility(commands.Cog):
                 logger.error(f"Error in reminder checker: {e}", exc_info=True)
                 await asyncio.sleep(60)
 
-    @app_commands.command(name="help", description="View a guide to Logiq commands and setup")
+    @app_commands.command(name="help", description="View a guide to Logiq - Enhanced commands and setup")
     @app_commands.describe(topic="Optional help section to open directly")
     @app_commands.choices(topic=HELP_TOPIC_CHOICES)
     async def help_command(self, interaction: discord.Interaction, topic: Optional[app_commands.Choice[str]] = None):

@@ -142,7 +142,7 @@ class Admin(commands.Cog):
         total_channels = sum(len(g.channels) for g in self.bot.guilds)
 
         embed = EmbedFactory.create(
-            title="🤖 Logiq Information",
+            title="🤖 Logiq - Enhanced Information",
             color=EmbedColor.PRIMARY,
             thumbnail=self.bot.user.display_avatar.url if self.bot.user else None,
             fields=[

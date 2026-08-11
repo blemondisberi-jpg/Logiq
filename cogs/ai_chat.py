@@ -116,7 +116,7 @@ class AIChat(commands.Cog):
         messages = [
             {
                 "role": "system",
-                "content": "You are Logiq, a helpful AI assistant for Discord communities. "
+                "content": "You are Logiq - Enhanced, a helpful AI assistant for Discord communities. "
                           "Be concise, friendly, and helpful."
             }
         ] + self.conversation_history[user_id]

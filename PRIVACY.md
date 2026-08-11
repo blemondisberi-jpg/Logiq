@@ -1,10 +1,10 @@
-# Logiq Fork Privacy Policy
+# Logiq - Enhanced Privacy Policy
 
 Last updated: August 11, 2026
 
 ## 1. Overview
 
-This Privacy Policy applies to this forked and modified deployment of **Logiq**, a free and non-commercial Discord bot originally based on the open-source Logiq project.
+This Privacy Policy applies to **Logiq - Enhanced**, a forked and modified deployment of the open-source Logiq Discord bot project.
 
 This policy explains, in general terms, what information this fork may process in order to provide bot features inside Discord servers.
 

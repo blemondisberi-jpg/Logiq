@@ -5,10 +5,10 @@ Constants and configuration values for Logiq
 from typing import Dict, Any
 
 # Bot Information
-BOT_NAME = "Logiq"
+BOT_NAME = "Logiq - Enhanced"
 BOT_VERSION = "1.0.0"
 BOT_DESCRIPTION = "AI-enhanced Discord bot for community management"
-BOT_GITHUB = "https://github.com/yourusername/Logiq"
+BOT_GITHUB = "https://github.com/blemondisberi-jpg/Logiq"
 
 # Emoji Constants
 EMOJIS = {

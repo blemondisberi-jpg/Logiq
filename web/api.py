@@ -225,8 +225,8 @@ def create_app(bot) -> FastAPI:
     """Create FastAPI application"""
 
     app = FastAPI(
-        title="Logiq API",
-        description="REST API for Logiq Discord Bot",
+        title="Logiq - Enhanced API",
+        description="REST API for Logiq - Enhanced Discord Bot",
         version="1.0.0"
     )
 
@@ -249,9 +249,9 @@ def create_app(bot) -> FastAPI:
                 return f.read()
         return """
         <html>
-            <head><title>Logiq Admin Dashboard</title></head>
+            <head><title>Logiq - Enhanced Admin Dashboard</title></head>
             <body>
-                <h1>Logiq API</h1>
+                <h1>Logiq - Enhanced API</h1>
                 <p>Version: 1.0.0</p>
                 <p>Status: Online</p>
                 <p>Bot User: {}</p>
@@ -273,12 +273,12 @@ def create_app(bot) -> FastAPI:
     @app.get("/terms", response_class=HTMLResponse)
     async def terms_of_service():
         """Public Terms of Service page for platform review and general reference."""
-        return load_policy_html(TERMS_PATH, "Logiq Fork Terms of Service")
+        return load_policy_html(TERMS_PATH, "Logiq - Enhanced Terms of Service")
 
     @app.get("/privacy", response_class=HTMLResponse)
     async def privacy_policy():
         """Public Privacy Policy page for platform review and general reference."""
-        return load_policy_html(PRIVACY_PATH, "Logiq Fork Privacy Policy")
+        return load_policy_html(PRIVACY_PATH, "Logiq - Enhanced Privacy Policy")
 
     @app.get("/stats")
     async def get_stats():

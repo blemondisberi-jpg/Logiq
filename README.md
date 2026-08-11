@@ -1,4 +1,4 @@
-# 🤖 Logiq - Open Source Discord Bot
+# 🤖 Logiq - Enhanced - Open Source Discord Bot
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -7,7 +7,7 @@
 
 **The Open-Source Alternative to MEE6**
 
-Logiq is a feature-rich, fully open-source Discord bot packed with the systems most servers actually need: verification, role menus, alerts, moderation, welcome cards, server utility, temporary voice, tickets, birthdays, audit logging, embeds, and more. Built by **Programmify** and the open-source community.
+Logiq - Enhanced is a feature-rich, fully open-source Discord bot packed with the systems most servers actually need: verification, role menus, alerts, moderation, welcome cards, server utility, temporary voice, tickets, birthdays, audit logging, embeds, and more. Built on the Logiq project by **Programmify** and extended by the open-source community.
 
 🌟 **Star this repo** if you find it useful!
 
@@ -42,7 +42,7 @@ If Discord still looks stale, restart the client and give global commands a litt
 
 ---
 
-## ✨ What Logiq Does Right Now
+## ✨ What Logiq - Enhanced Does Right Now
 
 ### 🔐 Verification & Onboarding
 - Rules panels with a built-in **Accept** flow
@@ -99,7 +99,7 @@ If Discord still looks stale, restart the client and give global commands a litt
 
 ## 🧩 Cog Overview
 
-Logiq currently ships with these cogs:
+Logiq - Enhanced currently ships with these cogs:
 
 - `admin.py`
 - `ai_chat.py`
@@ -234,7 +234,7 @@ Member reads rules → clicks **Accept** → completes captcha in DMs → links 
 
 ## 📢 Social Alerts Setup
 
-Logiq now supports different alert types:
+Logiq - Enhanced now supports different alert types:
 
 - `live`
 - `post`
