@@ -45,6 +45,43 @@ def parse_rfc3339_timestamp(timestamp: str) -> datetime | None:
         return None
 
 
+def render_inline_markdown(text: str) -> str:
+    """Render a minimal safe subset of inline Markdown to HTML."""
+    pattern = re.compile(r"(\[([^\]]+)\]\(([^)]+)\)|\*\*([^*]+)\*\*|`([^`]+)`)")
+    html_parts: list[str] = []
+    last_index = 0
+
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if start > last_index:
+            html_parts.append(escape(text[last_index:start]))
+
+        link_label = match.group(2)
+        link_url = match.group(3)
+        bold_text = match.group(4)
+        code_text = match.group(5)
+
+        if link_label is not None and link_url is not None:
+            safe_url = link_url.strip()
+            if safe_url.startswith(("http://", "https://", "mailto:")):
+                html_parts.append(
+                    f'<a href="{escape(safe_url, quote=True)}" target="_blank" rel="noopener noreferrer">{escape(link_label)}</a>'
+                )
+            else:
+                html_parts.append(escape(match.group(0)))
+        elif bold_text is not None:
+            html_parts.append(f"<strong>{escape(bold_text)}</strong>")
+        elif code_text is not None:
+            html_parts.append(f"<code>{escape(code_text)}</code>")
+
+        last_index = end
+
+    if last_index < len(text):
+        html_parts.append(escape(text[last_index:]))
+
+    return "".join(html_parts)
+
+
 def render_markdown_document(title: str, markdown_text: str) -> str:
     """Render a lightweight Markdown document as simple HTML."""
     lines = markdown_text.splitlines()
@@ -83,30 +120,29 @@ def render_markdown_document(title: str, markdown_text: str) -> str:
 
         if not stripped:
             close_list()
-            html_parts.append("<p></p>")
             continue
 
         if stripped.startswith("# "):
             close_list()
-            html_parts.append(f"<h1>{escape(stripped[2:])}</h1>")
+            html_parts.append(f"<h1>{render_inline_markdown(stripped[2:])}</h1>")
             continue
         if stripped.startswith("## "):
             close_list()
-            html_parts.append(f"<h2>{escape(stripped[3:])}</h2>")
+            html_parts.append(f"<h2>{render_inline_markdown(stripped[3:])}</h2>")
             continue
         if stripped.startswith("### "):
             close_list()
-            html_parts.append(f"<h3>{escape(stripped[4:])}</h3>")
+            html_parts.append(f"<h3>{render_inline_markdown(stripped[4:])}</h3>")
             continue
         if stripped.startswith("- "):
             if not in_list:
                 html_parts.append("<ul>")
                 in_list = True
-            html_parts.append(f"<li>{escape(stripped[2:])}</li>")
+            html_parts.append(f"<li>{render_inline_markdown(stripped[2:])}</li>")
             continue
 
         close_list()
-        html_parts.append(f"<p>{escape(stripped)}</p>")
+        html_parts.append(f"<p>{render_inline_markdown(stripped)}</p>")
 
     close_list()
     close_code()
@@ -140,6 +176,17 @@ def render_markdown_document(title: str, markdown_text: str) -> str:
                 p {{
                     margin: 14px 0;
                 }}
+                a {{
+                    color: #2563eb;
+                    text-decoration: none;
+                    font-weight: 600;
+                }}
+                a:hover {{
+                    text-decoration: underline;
+                }}
+                strong {{
+                    font-weight: 700;
+                }}
                 ul {{
                     margin: 12px 0 12px 22px;
                 }}
@@ -154,6 +201,9 @@ def render_markdown_document(title: str, markdown_text: str) -> str:
                 }}
                 code {{
                     font-family: Menlo, Monaco, Consolas, monospace;
+                    background: #f3f4f6;
+                    padding: 2px 6px;
+                    border-radius: 6px;
                 }}
             </style>
         </head>
