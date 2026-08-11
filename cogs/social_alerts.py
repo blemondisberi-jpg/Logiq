@@ -1,6 +1,6 @@
 """
 Social Alerts Cog for Logiq
-Monitor Twitch, YouTube, Twitter/X for new content
+Monitor Twitch, YouTube, Instagram, TikTok, and Twitter/X for new content
 """
 
 import asyncio
@@ -29,20 +29,32 @@ from utils.permissions import is_admin
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_PLATFORMS = ["twitch", "youtube", "kick", "twitter"]
-DEFAULT_ALERT_TEMPLATE = (
+SUPPORTED_PLATFORMS = ["twitch", "youtube", "kick", "instagram", "tiktok", "twitter"]
+SUPPORTED_ALERT_TYPES = ("live", "post")
+DEFAULT_LIVE_ALERT_TEMPLATE = (
     "Hey @everyone, **{display_name}** is now live on {url}! Go check it out!"
 )
+DEFAULT_POST_ALERT_TEMPLATES = {
+    "youtube": "Hey @everyone, **{display_name}** just uploaded a new YouTube video: {title}\n{url}",
+    "instagram": "Hey @everyone, **{display_name}** just posted on Instagram.\n{url}",
+    "tiktok": "Hey @everyone, **{display_name}** just posted on TikTok: {title}\n{url}",
+    "twitter": "Hey @everyone, **{display_name}** just posted on X/Twitter.\n{url}",
+}
 TWITCH_EMBED_COLOR = 0x9146FF
 YOUTUBE_EMBED_COLOR = 0xFF0000
 KICK_EMBED_COLOR = 0x53FC18
 TWITTER_EMBED_COLOR = 0x1DA1F2
+INSTAGRAM_EMBED_COLOR = 0xE1306C
+TIKTOK_EMBED_COLOR = 0x25F4EE
 TWITCH_EVENTSUB_PATH = "/webhooks/twitch/eventsub"
 KICK_EVENTS_PATH = "/webhooks/kick/events"
 YOUTUBE_OAUTH_CALLBACK_PATH = "/oauth/youtube/callback"
+TIKTOK_OAUTH_CALLBACK_PATH = "/oauth/tiktok/callback"
 TWITCH_EVENTSUB_TYPES = ("stream.online", "stream.offline")
 KICK_EVENT_TYPES = ("livestream.status.updated", "livestream.metadata.updated")
 YOUTUBE_OAUTH_SCOPES = ("https://www.googleapis.com/auth/youtube.readonly",)
+TIKTOK_OAUTH_SCOPES = ("user.info.basic", "video.list")
+INSTAGRAM_GRAPH_BASE_URL = "https://graph.instagram.com"
 TWITCH_EVENTSUB_RECREATE_STATUSES = {
     "webhook_callback_verification_failed",
     "notification_failures_exceeded",
@@ -69,6 +81,7 @@ class SocialAlertTemplateModal(discord.ui.Modal):
         self,
         cog: "SocialAlerts",
         platform: str,
+        alert_type: str,
         username: str,
         channel: Optional[discord.TextChannel],
         mode: str,
@@ -78,6 +91,7 @@ class SocialAlertTemplateModal(discord.ui.Modal):
         super().__init__(title=title)
         self.cog = cog
         self.platform = platform
+        self.alert_type = alert_type
         self.username = username
         self.channel = channel
         self.mode = mode
@@ -85,11 +99,11 @@ class SocialAlertTemplateModal(discord.ui.Modal):
 
         default_value = None
         if existing_alert:
-            default_value = existing_alert.get("message_template") or DEFAULT_ALERT_TEMPLATE
+            default_value = existing_alert.get("message_template") or cog._get_default_alert_template(platform, alert_type)
 
         self.message_template = discord.ui.TextInput(
             label="Announcement Message",
-            placeholder="Use {display_name}, {url}, {title}, {everyone}. Discord markdown works here.",
+            placeholder="Use {display_name}, {url}, {title}, {platform}, {everyone}. Discord markdown works here.",
             style=discord.TextStyle.paragraph,
             required=False,
             default=default_value,
@@ -106,6 +120,7 @@ class SocialAlertTemplateModal(discord.ui.Modal):
             await self.cog._create_alert_record(
                 interaction,
                 self.platform,
+                self.alert_type,
                 self.username,
                 self.channel,
                 message_template
@@ -114,6 +129,7 @@ class SocialAlertTemplateModal(discord.ui.Modal):
             await self.cog._update_alert_record(
                 interaction,
                 self.platform,
+                self.alert_type,
                 self.username,
                 self.channel,
                 message_template,
@@ -163,6 +179,55 @@ class SocialAlerts(commands.Cog):
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
         return self.session
+
+    def _get_alert_type(self, alert: dict) -> str:
+        """Return the normalized alert type, defaulting legacy alerts to live."""
+        alert_type = str(alert.get("alert_type") or "live").lower().strip()
+        return alert_type if alert_type in SUPPORTED_ALERT_TYPES else "live"
+
+    def _get_default_alert_type(self, platform: str) -> str:
+        """Return the default alert type for a platform."""
+        if platform in {"instagram", "tiktok", "twitter"}:
+            return "post"
+        return "live"
+
+    def _normalize_alert_type(self, platform: str, alert_type: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        """Validate alert type choices against the selected platform."""
+        requested = (alert_type or "").lower().strip()
+        if requested in {"", "auto", "default"}:
+            requested = self._get_default_alert_type(platform)
+
+        if requested not in SUPPORTED_ALERT_TYPES:
+            return None, "Alert type must be `live` or `post`."
+
+        if platform in {"twitch", "kick"} and requested != "live":
+            return None, f"{platform.title()} only supports `live` alerts."
+        if platform in {"instagram", "tiktok", "twitter"} and requested != "post":
+            return None, f"{platform.title()} only supports `post` alerts."
+
+        return requested, None
+
+    def _get_default_alert_template(self, platform: str, alert_type: str) -> str:
+        """Return the default message template for the alert."""
+        if alert_type == "live":
+            return DEFAULT_LIVE_ALERT_TEMPLATE
+        return DEFAULT_POST_ALERT_TEMPLATES.get(
+            platform,
+            "Hey @everyone, **{display_name}** just posted new content: {title}\n{url}"
+        )
+
+    def _build_alert_lookup_query(self, guild_id: int, platform: str, username: str, alert_type: str) -> dict:
+        """Build a Mongo query that still matches legacy live alerts without an explicit type."""
+        query = {
+            "guild_id": guild_id,
+            "platform": platform,
+            "username": username,
+        }
+        if alert_type == "live":
+            query["$or"] = [{"alert_type": "live"}, {"alert_type": {"$exists": False}}]
+        else:
+            query["alert_type"] = alert_type
+        return query
 
     def _get_twitch_credentials(self) -> tuple[Optional[str], Optional[str]]:
         """Load Twitch credentials from environment or config."""
@@ -283,6 +348,21 @@ class SocialAlerts(commands.Cog):
         base_url = self._get_public_base_url()
         return base_url + YOUTUBE_OAUTH_CALLBACK_PATH if base_url else None
 
+    def _get_tiktok_oauth_credentials(self) -> tuple[Optional[str], Optional[str]]:
+        """Load TikTok OAuth client credentials."""
+        client_key = os.getenv("TIKTOK_CLIENT_KEY") or self.config.get("api_keys", {}).get("tiktok_client_key")
+        client_secret = os.getenv("TIKTOK_CLIENT_SECRET") or self.config.get("api_keys", {}).get("tiktok_client_secret")
+        return client_key, client_secret
+
+    def _get_tiktok_oauth_redirect_uri(self) -> Optional[str]:
+        """Build the TikTok OAuth callback URL."""
+        redirect_uri = os.getenv("TIKTOK_OAUTH_REDIRECT_URI")
+        if redirect_uri:
+            redirect_uri = redirect_uri.strip().rstrip("/")
+            return redirect_uri if redirect_uri.startswith("https://") else None
+        base_url = self._get_public_base_url()
+        return base_url + TIKTOK_OAUTH_CALLBACK_PATH if base_url else None
+
     def _eventsub_is_configured(self) -> bool:
         """Whether this deployment is configured for Twitch EventSub webhooks."""
         return bool(self._get_twitch_eventsub_secret() and self._get_twitch_eventsub_callback_url())
@@ -296,6 +376,11 @@ class SocialAlerts(commands.Cog):
         """Whether this deployment can complete the optional YouTube owner OAuth flow."""
         client_id, client_secret = self._get_youtube_oauth_credentials()
         return bool(client_id and client_secret and self._get_youtube_oauth_redirect_uri())
+
+    def _tiktok_oauth_is_configured(self) -> bool:
+        """Whether this deployment can complete the TikTok owner OAuth flow."""
+        client_key, client_secret = self._get_tiktok_oauth_credentials()
+        return bool(client_key and client_secret and self._get_tiktok_oauth_redirect_uri())
 
     def _eventsub_status_is_healthy(self, status: str) -> bool:
         """Whether an EventSub subscription status is fully healthy."""
@@ -320,17 +405,20 @@ class SocialAlerts(commands.Cog):
 
     def _render_alert_message(self, template: Optional[str], context: dict) -> str:
         """Render a user-configurable alert template with safe fallbacks."""
-        message_template = template or DEFAULT_ALERT_TEMPLATE
+        platform_name = str(context.get("platform", "")).lower()
+        alert_type = str(context.get("alert_type", "live")).lower()
+        fallback_template = self._get_default_alert_template(platform_name, alert_type)
+        message_template = template or fallback_template
         try:
             return message_template.format(**context)
         except KeyError as error:
             missing = error.args[0]
             logger.warning("Alert template missing placeholder %s, falling back to default template", missing)
-            return DEFAULT_ALERT_TEMPLATE.format(**context)
+            return fallback_template.format(**context)
 
-    def _format_alert_preview(self, message_template: Optional[str]) -> str:
+    def _format_alert_preview(self, platform: str, alert_type: str, message_template: Optional[str]) -> str:
         """Format the saved template for confirmations."""
-        return message_template or DEFAULT_ALERT_TEMPLATE
+        return message_template or self._get_default_alert_template(platform, alert_type)
 
     def _get_twitch_preview_url(self, stream: dict) -> str:
         """Build a Twitch preview URL with cache busting so Discord refreshes each stream image."""
@@ -452,6 +540,7 @@ class SocialAlerts(commands.Cog):
         self,
         interaction: discord.Interaction,
         platform: str,
+        alert_type: str,
         username: str,
         channel: discord.TextChannel,
         message_template: Optional[str]
@@ -462,6 +551,7 @@ class SocialAlerts(commands.Cog):
             "guild_id": interaction.guild.id,
             "channel_id": channel.id,
             "platform": platform,
+            "alert_type": alert_type,
             "username": normalized_username,
             "message_template": message_template,
             "last_check": None,
@@ -475,48 +565,57 @@ class SocialAlerts(commands.Cog):
             "twitch": "🟣",
             "youtube": "🔴",
             "kick": "🟢",
-            "twitter": "🐦"
+            "twitter": "🐦",
+            "instagram": "📸",
+            "tiktok": "🎵"
         }
-        template_preview = self._format_alert_preview(message_template)
-        is_live_platform = platform in {"twitch", "youtube", "kick"}
+        template_preview = self._format_alert_preview(platform, alert_type, message_template)
+        is_live_platform = alert_type == "live"
 
         embed = EmbedFactory.success(
             "Alert Added",
-            f"{platform_emoji.get(platform, '📢')} **{platform.title()}** alert added!\n\n"
+            f"{platform_emoji.get(platform, '📢')} **{platform.title()}** {alert_type} alert added!\n\n"
             f"**Username:** {normalized_username}\n"
+            f"**Type:** {alert_type}\n"
             f"**Channel:** {channel.mention}\n"
             f"**Custom Message:**\n{template_preview}\n\n"
             f"You'll be notified when {normalized_username} {'goes live' if is_live_platform else 'posts new content'}!"
         )
-        if platform == "twitch":
+        if platform == "twitch" and alert_type == "live":
             await self._reconcile_twitch_eventsub_subscriptions()
             embed.add_field(
                 name="Initial Check",
                 value="Ran an immediate Twitch status check for this alert.",
                 inline=False
             )
-        elif platform == "kick":
+        elif platform == "kick" and alert_type == "live":
             await self._reconcile_kick_event_subscriptions()
             embed.add_field(
                 name="Webhook Sync",
                 value="Synced Kick webhook subscriptions for this alert.",
                 inline=False
             )
-        if platform in {"twitch", "youtube", "kick"}:
-            await self._run_single_alert_check(alert_data)
-            if platform == "youtube":
-                embed.add_field(
-                    name="Initial Check",
-                    value=f"Ran an immediate {platform.title()} status check for this alert.",
-                    inline=False
-                )
+        await self._run_single_alert_check(alert_data)
+        if platform == "youtube":
+            embed.add_field(
+                name="Initial Check",
+                value=f"Ran an immediate YouTube {alert_type} check for this alert.",
+                inline=False
+            )
+        elif alert_type == "post":
+            embed.add_field(
+                name="Initial Check",
+                value="Primed the alert so the current latest post becomes the baseline instead of being re-announced.",
+                inline=False
+            )
         await interaction.response.send_message(embed=embed, ephemeral=True)
-        logger.info("%s added %s alert for %s", interaction.user, platform, normalized_username)
+        logger.info("%s added %s/%s alert for %s", interaction.user, platform, alert_type, normalized_username)
 
     async def _update_alert_record(
         self,
         interaction: discord.Interaction,
         platform: str,
+        alert_type: str,
         username: str,
         channel: Optional[discord.TextChannel],
         message_template: Optional[str],
@@ -532,19 +631,19 @@ class SocialAlerts(commands.Cog):
         await self.db.db.social_alerts.update_one({"_id": existing_alert["_id"]}, {"$set": update_data})
 
         updated_channel = channel or interaction.guild.get_channel(existing_alert["channel_id"])
-        template_preview = self._format_alert_preview(message_template)
+        template_preview = self._format_alert_preview(platform, alert_type, message_template)
         embed = EmbedFactory.success(
             "Alert Updated",
-            f"Updated alert for **{username}** on **{platform}**.\n\n"
+            f"Updated {alert_type} alert for **{username}** on **{platform}**.\n\n"
             f"**Channel:** {updated_channel.mention if updated_channel else 'Unknown'}\n"
             f"**Custom Message:**\n{template_preview}"
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
-        if platform == "twitch":
+        if platform == "twitch" and alert_type == "live":
             await self._reconcile_twitch_eventsub_subscriptions()
-        elif platform == "kick":
+        elif platform == "kick" and alert_type == "live":
             await self._reconcile_kick_event_subscriptions()
-        logger.info("%s updated %s alert for %s", interaction.user, platform, existing_alert["username"])
+        logger.info("%s updated %s/%s alert for %s", interaction.user, platform, alert_type, existing_alert["username"])
 
     def _build_twitch_embed(self, stream: dict, user: dict) -> discord.Embed:
         """Build a rich Twitch live embed."""
@@ -683,6 +782,119 @@ class SocialAlerts(commands.Cog):
                 started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
                 footer_text = f"YouTube • {started.strftime('%d/%m/%Y, %H:%M')}"
             except ValueError:
+                pass
+        embed.set_footer(text=footer_text)
+        return embed
+
+    def _build_youtube_video_embed(self, video: dict, channel_data: dict) -> discord.Embed:
+        """Build a rich YouTube upload embed."""
+        snippet = channel_data.get("snippet") or {}
+        channel_title = snippet.get("title") or channel_data.get("id") or "YouTube Channel"
+        video_url = video.get("url") or "https://youtube.com"
+        description = f"[Watch on YouTube]({video_url})"
+        video_description = (video.get("description") or "").strip()
+        if video_description:
+            description += f"\n\n{video_description[:300]}"
+
+        embed = EmbedFactory.create(
+            title=video.get("title") or "New YouTube Video",
+            description=description,
+            color=YOUTUBE_EMBED_COLOR,
+            timestamp=False
+        )
+        embed.set_author(name=channel_title, url=video_url)
+
+        thumbnail_url = self._get_best_youtube_thumbnail(snippet.get("thumbnails"))
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
+
+        preview_url = video.get("thumbnail_url")
+        if preview_url:
+            embed.set_image(url=preview_url)
+
+        published_at = video.get("published_at")
+        footer_text = "YouTube"
+        if published_at:
+            try:
+                published = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
+                footer_text = f"YouTube • {published.strftime('%d/%m/%Y, %H:%M')}"
+            except ValueError:
+                pass
+        embed.set_footer(text=footer_text)
+        return embed
+
+    def _build_instagram_post_embed(self, media: dict, profile: dict) -> discord.Embed:
+        """Build an Instagram post embed."""
+        permalink = media.get("permalink") or "https://instagram.com"
+        caption = (media.get("caption") or "").strip()
+        description = f"[View post on Instagram]({permalink})"
+        if caption:
+            description += f"\n\n{caption[:300]}"
+
+        embed = EmbedFactory.create(
+            title="New Instagram Post",
+            description=description,
+            color=INSTAGRAM_EMBED_COLOR,
+            timestamp=False
+        )
+        embed.set_author(
+            name=profile.get("username") or profile.get("name") or "Instagram",
+            url=permalink
+        )
+
+        profile_image = profile.get("profile_picture_url")
+        if profile_image:
+            embed.set_thumbnail(url=profile_image)
+
+        media_url = media.get("thumbnail_url") or media.get("media_url")
+        if media_url:
+            embed.set_image(url=media_url)
+
+        timestamp = media.get("timestamp")
+        footer_text = "Instagram"
+        if timestamp:
+            try:
+                published = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                footer_text = f"Instagram • {published.strftime('%d/%m/%Y, %H:%M')}"
+            except ValueError:
+                pass
+        embed.set_footer(text=footer_text)
+        return embed
+
+    def _build_tiktok_post_embed(self, video: dict, profile: dict) -> discord.Embed:
+        """Build a TikTok post embed."""
+        video_url = video.get("share_url") or profile.get("profile_deep_link") or "https://www.tiktok.com"
+        description = f"[Watch on TikTok]({video_url})"
+        video_description = (video.get("video_description") or "").strip()
+        if video_description:
+            description += f"\n\n{video_description[:300]}"
+
+        embed = EmbedFactory.create(
+            title=video.get("title") or "New TikTok Post",
+            description=description,
+            color=TIKTOK_EMBED_COLOR,
+            timestamp=False
+        )
+        embed.set_author(
+            name=profile.get("display_name") or "TikTok",
+            url=profile.get("profile_deep_link") or video_url
+        )
+
+        avatar_url = profile.get("avatar_url")
+        if avatar_url:
+            embed.set_thumbnail(url=avatar_url)
+
+        preview_url = video.get("cover_image_url")
+        if preview_url:
+            embed.set_image(url=preview_url)
+
+        created_at = video.get("create_time")
+        footer_text = "TikTok"
+        if created_at:
+            try:
+                published = datetime.fromtimestamp(int(created_at))
+                footer_text = f"TikTok • {published.strftime('%d/%m/%Y, %H:%M')}"
+            except (TypeError, ValueError, OSError):
                 pass
         embed.set_footer(text=footer_text)
         return embed
@@ -1027,7 +1239,7 @@ class SocialAlerts(commands.Cog):
         if not lookup_value:
             return None, "Please provide a valid YouTube handle, channel ID, or profile URL."
 
-        params = {"part": "snippet", "key": api_key}
+        params = {"part": "snippet,contentDetails", "key": api_key}
         if lookup_type == "handle":
             params["forHandle"] = lookup_value
         elif lookup_type == "username":
@@ -1049,7 +1261,7 @@ class SocialAlerts(commands.Cog):
 
         items = data.get("items", [])
         if not items and lookup_type == "handle":
-            fallback_params = {"part": "snippet", "key": api_key, "forUsername": lookup_value.lstrip("@")}
+            fallback_params = {"part": "snippet,contentDetails", "key": api_key, "forUsername": lookup_value.lstrip("@")}
             try:
                 async with session.get("https://www.googleapis.com/youtube/v3/channels", params=fallback_params) as response:
                     if response.status == 200:
@@ -1108,6 +1320,221 @@ class SocialAlerts(commands.Cog):
         if not video.get("thumbnail_url"):
             video["thumbnail_url"] = self._get_best_youtube_thumbnail(search_item.get("snippet", {}).get("thumbnails"))
         return video, None
+
+    async def _fetch_youtube_latest_upload(self, channel_data: dict) -> tuple[Optional[dict], Optional[str]]:
+        """Fetch the newest uploaded YouTube video for a channel."""
+        uploads_playlist_id = (((channel_data.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads"))
+        if not uploads_playlist_id:
+            return None, "YouTube did not return an uploads playlist for this channel."
+
+        api_key = self._get_youtube_api_key()
+        if not api_key:
+            return None, "YOUTUBE_API_KEY is missing."
+
+        session = await self.get_session()
+        params = {
+            "part": "snippet,contentDetails,status",
+            "playlistId": uploads_playlist_id,
+            "maxResults": 5,
+            "key": api_key
+        }
+
+        try:
+            async with session.get("https://www.googleapis.com/youtube/v3/playlistItems", params=params) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to fetch YouTube uploads playlist %s: %s %s", uploads_playlist_id, response.status, body)
+                    return None, f"YouTube uploads lookup failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching YouTube uploads playlist %s: %s", uploads_playlist_id, error, exc_info=True)
+            return None, "Could not contact YouTube while loading the uploads playlist."
+
+        for item in data.get("items", []):
+            snippet = item.get("snippet") or {}
+            status = item.get("status") or {}
+            video_id = ((item.get("contentDetails") or {}).get("videoId") or "").strip()
+            if not video_id:
+                continue
+            if snippet.get("title") in {"Private video", "Deleted video"}:
+                continue
+
+            details, detail_error = await self._fetch_youtube_video_details(video_id, api_key=api_key)
+            if detail_error and not details:
+                logger.warning("Falling back to playlist snippet for YouTube upload %s because details lookup failed: %s", video_id, detail_error)
+
+            published_at = snippet.get("publishedAt")
+            return {
+                "id": video_id,
+                "title": (details or {}).get("title") or snippet.get("title") or "New YouTube Video",
+                "description": snippet.get("description") or "",
+                "thumbnail_url": (details or {}).get("thumbnail_url") or self._get_best_youtube_thumbnail(snippet.get("thumbnails")),
+                "published_at": published_at,
+                "url": (details or {}).get("url") or f"https://www.youtube.com/watch?v={video_id}",
+                "privacy_status": status.get("privacyStatus") or "public",
+            }, None
+
+        return None, None
+
+    async def _get_tiktok_user_access_token(self, alert: dict) -> tuple[Optional[str], Optional[str]]:
+        """Return a usable TikTok access token, refreshing if needed."""
+        client_key, client_secret = self._get_tiktok_oauth_credentials()
+        if not client_key or not client_secret:
+            return None, "TikTok OAuth client credentials are missing."
+
+        access_token = alert.get("tiktok_access_token")
+        expires_at = alert.get("tiktok_access_token_expires_at")
+        if access_token and expires_at:
+            try:
+                if float(expires_at) > discord.utils.utcnow().timestamp() + 60:
+                    return str(access_token), None
+            except (TypeError, ValueError):
+                pass
+
+        refresh_token = alert.get("tiktok_refresh_token")
+        if not refresh_token:
+            return None, "This TikTok alert is not connected yet. Run `/alert tiktok-connect` first."
+
+        session = await self.get_session()
+        payload = {
+            "client_key": client_key,
+            "client_secret": client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+
+        try:
+            async with session.post("https://open.tiktokapis.com/v2/oauth/token/", data=payload) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to refresh TikTok token: %s %s", response.status, body)
+                    return None, f"TikTok token refresh failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Error refreshing TikTok token: %s", error, exc_info=True)
+            return None, "Could not contact TikTok while refreshing the access token."
+
+        new_access_token = data.get("access_token")
+        if not new_access_token:
+            return None, "TikTok did not return a refreshed access token."
+
+        expires_in = int(data.get("expires_in", 86400))
+        refresh_expires_in = int(data.get("refresh_expires_in", 31536000))
+        update_data = {
+            "tiktok_access_token": new_access_token,
+            "tiktok_access_token_expires_at": discord.utils.utcnow().timestamp() + expires_in,
+            "tiktok_refresh_expires_at": discord.utils.utcnow().timestamp() + refresh_expires_in,
+        }
+        if data.get("refresh_token"):
+            update_data["tiktok_refresh_token"] = data["refresh_token"]
+        await self.db.db.social_alerts.update_one({"_id": alert["_id"]}, {"$set": update_data})
+        return new_access_token, None
+
+    async def _fetch_tiktok_profile(self, access_token: str) -> tuple[Optional[dict], Optional[str]]:
+        """Fetch TikTok profile metadata for the connected account."""
+        session = await self.get_session()
+        headers = {"Authorization": f"Bearer {access_token}"}
+        try:
+            async with session.get(
+                "https://open.tiktokapis.com/v2/user/info/",
+                params={"fields": "open_id,display_name,avatar_url,profile_deep_link"},
+                headers=headers
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to fetch TikTok profile: %s %s", response.status, body)
+                    return None, f"TikTok profile lookup failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching TikTok profile: %s", error, exc_info=True)
+            return None, "Could not contact TikTok while loading the profile."
+
+        user = (data.get("data") or {}).get("user")
+        if not user:
+            return None, "TikTok did not return profile information for this connected account."
+        return user, None
+
+    async def _fetch_tiktok_latest_video(self, access_token: str) -> tuple[Optional[dict], Optional[str]]:
+        """Fetch the newest TikTok video for the connected account."""
+        session = await self.get_session()
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        params = {
+            "fields": "id,title,video_description,duration,cover_image_url,share_url,view_count,like_count,comment_count,share_count,create_time"
+        }
+        payload = {"max_count": 5}
+
+        try:
+            async with session.post("https://open.tiktokapis.com/v2/video/list/", params=params, headers=headers, json=payload) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to fetch TikTok videos: %s %s", response.status, body)
+                    return None, f"TikTok video lookup failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching TikTok videos: %s", error, exc_info=True)
+            return None, "Could not contact TikTok while loading recent videos."
+
+        videos = (data.get("data") or {}).get("videos") or []
+        return (videos[0] if videos else None), None
+
+    async def _fetch_instagram_profile(self, alert: dict) -> tuple[Optional[dict], Optional[str]]:
+        """Fetch Instagram profile metadata for a manually connected professional account."""
+        access_token = alert.get("instagram_access_token")
+        instagram_user_id = alert.get("instagram_user_id")
+        if not access_token or not instagram_user_id:
+            return None, "This Instagram alert is not connected yet. Run `/alert instagram-connect-manual` first."
+
+        session = await self.get_session()
+        params = {
+            "fields": "id,username,name,profile_picture_url",
+            "access_token": access_token,
+        }
+        try:
+            async with session.get(f"{INSTAGRAM_GRAPH_BASE_URL}/v23.0/{instagram_user_id}", params=params) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to fetch Instagram profile %s: %s %s", instagram_user_id, response.status, body)
+                    return None, f"Instagram profile lookup failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching Instagram profile %s: %s", instagram_user_id, error, exc_info=True)
+            return None, "Could not contact Instagram while loading the connected profile."
+
+        return data, None
+
+    async def _fetch_instagram_latest_media(self, alert: dict) -> tuple[Optional[dict], Optional[str]]:
+        """Fetch the newest Instagram post for a manually connected professional account."""
+        access_token = alert.get("instagram_access_token")
+        instagram_user_id = alert.get("instagram_user_id")
+        if not access_token or not instagram_user_id:
+            return None, "This Instagram alert is not connected yet. Run `/alert instagram-connect-manual` first."
+
+        session = await self.get_session()
+        params = {
+            "fields": "id,caption,media_type,media_product_type,media_url,permalink,thumbnail_url,timestamp,username",
+            "limit": 5,
+            "access_token": access_token,
+        }
+        try:
+            async with session.get(f"{INSTAGRAM_GRAPH_BASE_URL}/v23.0/{instagram_user_id}/media", params=params) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed to fetch Instagram media %s: %s %s", instagram_user_id, response.status, body)
+                    return None, f"Instagram media lookup failed with HTTP {response.status}."
+                data = await response.json()
+        except aiohttp.ClientError as error:
+            logger.error("Error fetching Instagram media %s: %s", instagram_user_id, error, exc_info=True)
+            return None, "Could not contact Instagram while loading recent posts."
+
+        media_items = data.get("data") or []
+        for item in media_items:
+            if (item.get("media_product_type") or "").upper() == "STORY":
+                continue
+            return item, None
+        return None, None
 
     async def _fetch_kick_channels_batch(self, slugs: list[str]) -> tuple[dict[str, dict], Optional[str]]:
         """Fetch Kick channel metadata in batches."""
@@ -2287,6 +2714,85 @@ class SocialAlerts(commands.Cog):
             f"The alert for `{alert['username']}` is now linked to the owning YouTube channel and can use the YouTube Live API path."
         )
 
+    async def handle_tiktok_oauth_callback(
+        self,
+        *,
+        state: str,
+        code: Optional[str],
+        error: Optional[str]
+    ) -> tuple[str, str]:
+        """Complete the TikTok OAuth flow for a TikTok post alert."""
+        if error:
+            return "TikTok OAuth Cancelled", f"TikTok returned an OAuth error: {error}"
+
+        state_doc = await self._consume_oauth_state(state, "tiktok")
+        if not state_doc:
+            return "TikTok OAuth Failed", "This TikTok OAuth link is missing or has expired. Please generate a new one."
+
+        if not code:
+            return "TikTok OAuth Failed", "TikTok did not return an authorization code."
+
+        client_key, client_secret = self._get_tiktok_oauth_credentials()
+        redirect_uri = self._get_tiktok_oauth_redirect_uri()
+        if not client_key or not client_secret or not redirect_uri:
+            return "TikTok OAuth Failed", "The bot is missing TikTok OAuth configuration."
+
+        alert = await self.db.db.social_alerts.find_one({"_id": state_doc["alert_id"]})
+        if not alert:
+            return "TikTok OAuth Failed", "The target TikTok alert no longer exists."
+
+        session = await self.get_session()
+        payload = {
+            "client_key": client_key,
+            "client_secret": client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        }
+
+        try:
+            async with session.post("https://open.tiktokapis.com/v2/oauth/token/", data=payload) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.error("Failed TikTok OAuth token exchange: %s %s", response.status, body)
+                    return "TikTok OAuth Failed", f"TikTok token exchange failed with HTTP {response.status}."
+                token_data = await response.json()
+        except aiohttp.ClientError as token_error:
+            logger.error("Error exchanging TikTok OAuth code: %s", token_error, exc_info=True)
+            return "TikTok OAuth Failed", "Could not contact TikTok while exchanging the authorization code."
+
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        open_id = token_data.get("open_id")
+        if not access_token or not refresh_token or not open_id:
+            return "TikTok OAuth Failed", "TikTok did not return the required token payload."
+
+        profile, profile_error = await self._fetch_tiktok_profile(access_token)
+        if not profile:
+            return "TikTok OAuth Failed", profile_error or "Could not fetch the connected TikTok profile."
+
+        expires_in = int(token_data.get("expires_in", 86400))
+        refresh_expires_in = int(token_data.get("refresh_expires_in", 31536000))
+        await self.db.db.social_alerts.update_one(
+            {"_id": alert["_id"]},
+            {"$set": {
+                "tiktok_open_id": open_id,
+                "tiktok_access_token": access_token,
+                "tiktok_access_token_expires_at": discord.utils.utcnow().timestamp() + expires_in,
+                "tiktok_refresh_token": refresh_token,
+                "tiktok_refresh_expires_at": discord.utils.utcnow().timestamp() + refresh_expires_in,
+                "tiktok_display_name": profile.get("display_name"),
+                "tiktok_profile_deep_link": profile.get("profile_deep_link"),
+                "tiktok_avatar_url": profile.get("avatar_url"),
+                "tiktok_connected_at": discord.utils.utcnow().timestamp(),
+            }}
+        )
+
+        return (
+            "TikTok OAuth Connected",
+            f"The TikTok post alert for `{alert['username']}` is now linked to the authorized TikTok account."
+        )
+
     async def _send_twitch_alert(
         self,
         alert: dict,
@@ -2636,6 +3142,10 @@ class SocialAlerts(commands.Cog):
                     platform = alert["platform"]
                     if platform == "youtube":
                         await self.check_youtube(alert)
+                    elif platform == "instagram":
+                        await self.check_instagram(alert)
+                    elif platform == "tiktok":
+                        await self.check_tiktok(alert)
                     elif platform == "twitter":
                         await self.check_twitter(alert)
                 except Exception as error:
@@ -2737,6 +3247,10 @@ class SocialAlerts(commands.Cog):
 
     async def check_youtube(self, alert: dict):
         """Check YouTube for active live streams."""
+        if self._get_alert_type(alert) == "post":
+            await self.check_youtube_post(alert)
+            return
+
         oauth_enabled = bool(alert.get("youtube_refresh_token"))
         channel_data = None
         channel_error = None
@@ -2832,6 +3346,178 @@ class SocialAlerts(commands.Cog):
         else:
             await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
 
+    async def check_youtube_post(self, alert: dict):
+        """Check YouTube for newly uploaded videos."""
+        channel_data, channel_error = await self._fetch_youtube_channel(
+            alert["username"],
+            channel_id=alert.get("youtube_channel_id")
+        )
+        if not channel_data:
+            await self._save_alert_check_state(alert["_id"], status="channel_lookup_failed", error=channel_error)
+            return
+
+        if channel_data.get("id") and channel_data.get("id") != alert.get("youtube_channel_id"):
+            await self.db.db.social_alerts.update_one({"_id": alert["_id"]}, {"$set": {"youtube_channel_id": channel_data["id"]}})
+
+        video, video_error = await self._fetch_youtube_latest_upload(channel_data)
+        if video_error:
+            await self._save_alert_check_state(alert["_id"], status="post_lookup_failed", error=video_error)
+            return
+        if not video:
+            await self._save_alert_check_state(alert["_id"], status="no_content", error=None)
+            return
+
+        if not alert.get("last_content_id"):
+            await self._save_alert_check_state(
+                alert["_id"],
+                status="armed",
+                error=None,
+                stream_id=video["id"],
+                stream_title=video.get("title"),
+                stream_started_at=video.get("published_at")
+            )
+            return
+
+        if video["id"] == alert.get("last_content_id"):
+            await self._save_alert_check_state(
+                alert["_id"],
+                status="already_announced",
+                error=None,
+                stream_id=video["id"],
+                stream_title=video.get("title"),
+                stream_started_at=video.get("published_at")
+            )
+            return
+
+        guild = self.bot.get_guild(alert["guild_id"])
+        if not guild:
+            return
+        channel = guild.get_channel(alert["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            await self._save_alert_check_state(alert["_id"], status="channel_missing", error="Alert channel not found.")
+            return
+
+        snippet = channel_data.get("snippet") or {}
+        context = {
+            "username": alert["username"],
+            "display_name": snippet.get("title") or alert["username"],
+            "url": video.get("url"),
+            "title": video.get("title") or "New YouTube Video",
+            "platform": "youtube",
+            "alert_type": "post",
+            "everyone": "@everyone",
+            "here": "@here",
+        }
+        content = self._render_alert_message(alert.get("message_template"), context)
+        embed = self._build_youtube_video_embed(video, channel_data)
+        try:
+            await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True))
+            await self._save_alert_delivery_metadata(alert["_id"], source="poll", discord_sent_at=discord.utils.utcnow().timestamp())
+            await self._save_alert_check_state(
+                alert["_id"],
+                status="sent",
+                error=None,
+                stream_id=video["id"],
+                stream_title=video.get("title"),
+                stream_started_at=video.get("published_at")
+            )
+        except discord.HTTPException:
+            await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
+
+    async def check_instagram(self, alert: dict):
+        """Check Instagram for newly published posts."""
+        profile, profile_error = await self._fetch_instagram_profile(alert)
+        if not profile:
+            await self._save_alert_check_state(alert["_id"], status="auth_required", error=profile_error)
+            return
+        media, media_error = await self._fetch_instagram_latest_media(alert)
+        if media_error:
+            await self._save_alert_check_state(alert["_id"], status="post_lookup_failed", error=media_error)
+            return
+        if not media:
+            await self._save_alert_check_state(alert["_id"], status="no_content", error=None)
+            return
+        if not alert.get("last_content_id"):
+            await self._save_alert_check_state(alert["_id"], status="armed", error=None, stream_id=media["id"], stream_title="New Instagram Post", stream_started_at=media.get("timestamp"))
+            return
+        if media["id"] == alert.get("last_content_id"):
+            await self._save_alert_check_state(alert["_id"], status="already_announced", error=None, stream_id=media["id"], stream_title="New Instagram Post", stream_started_at=media.get("timestamp"))
+            return
+        guild = self.bot.get_guild(alert["guild_id"])
+        if not guild:
+            return
+        channel = guild.get_channel(alert["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            await self._save_alert_check_state(alert["_id"], status="channel_missing", error="Alert channel not found.")
+            return
+        context = {
+            "username": profile.get("username") or alert["username"],
+            "display_name": profile.get("name") or profile.get("username") or alert["username"],
+            "url": media.get("permalink"),
+            "title": (media.get("caption") or "New Instagram Post")[:120],
+            "platform": "instagram",
+            "alert_type": "post",
+            "everyone": "@everyone",
+            "here": "@here",
+        }
+        content = self._render_alert_message(alert.get("message_template"), context)
+        embed = self._build_instagram_post_embed(media, profile)
+        try:
+            await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True))
+            await self._save_alert_delivery_metadata(alert["_id"], source="poll", discord_sent_at=discord.utils.utcnow().timestamp())
+            await self._save_alert_check_state(alert["_id"], status="sent", error=None, stream_id=media["id"], stream_title="New Instagram Post", stream_started_at=media.get("timestamp"))
+        except discord.HTTPException:
+            await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
+
+    async def check_tiktok(self, alert: dict):
+        """Check TikTok for newly published videos."""
+        access_token, token_error = await self._get_tiktok_user_access_token(alert)
+        if not access_token:
+            await self._save_alert_check_state(alert["_id"], status="auth_required", error=token_error)
+            return
+        profile, profile_error = await self._fetch_tiktok_profile(access_token)
+        if not profile:
+            await self._save_alert_check_state(alert["_id"], status="profile_lookup_failed", error=profile_error)
+            return
+        video, video_error = await self._fetch_tiktok_latest_video(access_token)
+        if video_error:
+            await self._save_alert_check_state(alert["_id"], status="post_lookup_failed", error=video_error)
+            return
+        if not video:
+            await self._save_alert_check_state(alert["_id"], status="no_content", error=None)
+            return
+        if not alert.get("last_content_id"):
+            await self._save_alert_check_state(alert["_id"], status="armed", error=None, stream_id=video["id"], stream_title=video.get("title"), stream_started_at=video.get("create_time"))
+            return
+        if video["id"] == alert.get("last_content_id"):
+            await self._save_alert_check_state(alert["_id"], status="already_announced", error=None, stream_id=video["id"], stream_title=video.get("title"), stream_started_at=video.get("create_time"))
+            return
+        guild = self.bot.get_guild(alert["guild_id"])
+        if not guild:
+            return
+        channel = guild.get_channel(alert["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            await self._save_alert_check_state(alert["_id"], status="channel_missing", error="Alert channel not found.")
+            return
+        context = {
+            "username": alert["username"],
+            "display_name": profile.get("display_name") or alert["username"],
+            "url": video.get("share_url") or profile.get("profile_deep_link"),
+            "title": video.get("title") or video.get("video_description") or "New TikTok Post",
+            "platform": "tiktok",
+            "alert_type": "post",
+            "everyone": "@everyone",
+            "here": "@here",
+        }
+        content = self._render_alert_message(alert.get("message_template"), context)
+        embed = self._build_tiktok_post_embed(video, profile)
+        try:
+            await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True))
+            await self._save_alert_delivery_metadata(alert["_id"], source="poll", discord_sent_at=discord.utils.utcnow().timestamp())
+            await self._save_alert_check_state(alert["_id"], status="sent", error=None, stream_id=video["id"], stream_title=video.get("title"), stream_started_at=video.get("create_time"))
+        except discord.HTTPException:
+            await self._save_alert_check_state(alert["_id"], status="send_failed", error="Discord rejected the alert message.")
+
     async def check_kick(self, alert: dict):
         """Check Kick for live streams."""
         channel_data, channel_error = await self._fetch_kick_channel(alert["username"])
@@ -2900,14 +3586,19 @@ class SocialAlerts(commands.Cog):
             await self.check_youtube(alert)
         elif platform == "kick":
             await self.check_kick(alert)
+        elif platform == "instagram":
+            await self.check_instagram(alert)
+        elif platform == "tiktok":
+            await self.check_tiktok(alert)
         elif platform == "twitter":
             await self.check_twitter(alert)
 
     @alert_group.command(name="add", description="Add social media alert (Admin)")
     @app_commands.describe(
-        platform="Platform (twitch/youtube/kick/twitter)",
+        platform="Platform (twitch/youtube/kick/instagram/tiktok/twitter)",
         username="Username or channel ID",
-        channel="Channel to send alerts to"
+        channel="Channel to send alerts to",
+        alert_type="Use live or post. YouTube supports both."
     )
     @is_admin()
     async def add_alert(
@@ -2915,34 +3606,37 @@ class SocialAlerts(commands.Cog):
         interaction: discord.Interaction,
         platform: str,
         username: str,
-        channel: discord.TextChannel
+        channel: discord.TextChannel,
+        alert_type: Optional[str] = None
     ):
         """Open the social alert setup wizard."""
         platform = platform.lower()
         if platform not in SUPPORTED_PLATFORMS:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, or twitter"),
+                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, instagram, tiktok, or twitter"),
                 ephemeral=True
             )
+            return
+        resolved_alert_type, type_error = self._normalize_alert_type(platform, alert_type)
+        if not resolved_alert_type:
+            await interaction.response.send_message(embed=EmbedFactory.error("Invalid Alert Type", type_error or "Invalid alert type."), ephemeral=True)
             return
 
         normalized_username = self._normalize_alert_username(platform, username)
 
-        existing = await self.db.db.social_alerts.find_one({
-            "guild_id": interaction.guild.id,
-            "platform": platform,
-            "username": normalized_username
-        })
+        existing = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, platform, normalized_username, resolved_alert_type)
+        )
 
         if existing:
             await interaction.response.send_message(
-                embed=EmbedFactory.warning("Already Exists", f"Alert for {normalized_username} on {platform} already exists"),
+                embed=EmbedFactory.warning("Already Exists", f"{resolved_alert_type.title()} alert for {normalized_username} on {platform} already exists"),
                 ephemeral=True
             )
             return
 
         try:
-            modal = SocialAlertTemplateModal(self, platform, normalized_username, channel, mode="create")
+            modal = SocialAlertTemplateModal(self, platform, resolved_alert_type, normalized_username, channel, mode="create")
             await interaction.response.send_modal(modal)
         except Exception as error:
             logger.error("Failed to open social alert create modal: %s", error, exc_info=True)
@@ -2956,9 +3650,10 @@ class SocialAlerts(commands.Cog):
 
     @alert_group.command(name="edit", description="Edit an existing social media alert (Admin)")
     @app_commands.describe(
-        platform="Platform (twitch/youtube/kick/twitter)",
+        platform="Platform (twitch/youtube/kick/instagram/tiktok/twitter)",
         username="Username or channel ID",
-        channel="Optional new alert channel"
+        channel="Optional new alert channel",
+        alert_type="Use live or post. YouTube supports both."
     )
     @is_admin()
     async def edit_alert(
@@ -2966,27 +3661,30 @@ class SocialAlerts(commands.Cog):
         interaction: discord.Interaction,
         platform: str,
         username: str,
-        channel: Optional[discord.TextChannel] = None
+        channel: Optional[discord.TextChannel] = None,
+        alert_type: Optional[str] = None
     ):
         """Open the social alert edit wizard."""
         platform = platform.lower()
         if platform not in SUPPORTED_PLATFORMS:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, or twitter"),
+                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, instagram, tiktok, or twitter"),
                 ephemeral=True
             )
+            return
+        resolved_alert_type, type_error = self._normalize_alert_type(platform, alert_type)
+        if not resolved_alert_type:
+            await interaction.response.send_message(embed=EmbedFactory.error("Invalid Alert Type", type_error or "Invalid alert type."), ephemeral=True)
             return
 
         normalized_username = self._normalize_alert_username(platform, username)
 
-        alert = await self.db.db.social_alerts.find_one({
-            "guild_id": interaction.guild.id,
-            "platform": platform,
-            "username": normalized_username
-        })
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, platform, normalized_username, resolved_alert_type)
+        )
         if not alert:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not Found", f"No alert found for {normalized_username} on {platform}"),
+                embed=EmbedFactory.error("Not Found", f"No {resolved_alert_type} alert found for {normalized_username} on {platform}"),
                 ephemeral=True
             )
             return
@@ -2995,6 +3693,7 @@ class SocialAlerts(commands.Cog):
             modal = SocialAlertTemplateModal(
                 self,
                 platform,
+                resolved_alert_type,
                 normalized_username,
                 channel,
                 mode="edit",
@@ -3013,50 +3712,54 @@ class SocialAlerts(commands.Cog):
 
     @alert_group.command(name="remove", description="Remove social media alert (Admin)")
     @app_commands.describe(
-        platform="Platform (twitch/youtube/kick/twitter)",
-        username="Username or channel ID"
+        platform="Platform (twitch/youtube/kick/instagram/tiktok/twitter)",
+        username="Username or channel ID",
+        alert_type="Use live or post. YouTube supports both."
     )
     @is_admin()
     async def remove_alert(
         self,
         interaction: discord.Interaction,
         platform: str,
-        username: str
+        username: str,
+        alert_type: Optional[str] = None
     ):
         """Remove social media alert (ADMIN ONLY)"""
         platform = platform.lower()
         if platform not in SUPPORTED_PLATFORMS:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, or twitter"),
+                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, instagram, tiktok, or twitter"),
                 ephemeral=True
             )
+            return
+        resolved_alert_type, type_error = self._normalize_alert_type(platform, alert_type)
+        if not resolved_alert_type:
+            await interaction.response.send_message(embed=EmbedFactory.error("Invalid Alert Type", type_error or "Invalid alert type."), ephemeral=True)
             return
 
         normalized_username = self._normalize_alert_username(platform, username)
 
-        result = await self.db.db.social_alerts.delete_one({
-            "guild_id": interaction.guild.id,
-            "platform": platform,
-            "username": normalized_username
-        })
+        result = await self.db.db.social_alerts.delete_one(
+            self._build_alert_lookup_query(interaction.guild.id, platform, normalized_username, resolved_alert_type)
+        )
 
         if result.deleted_count == 0:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not Found", f"No alert found for {normalized_username} on {platform}"),
+                embed=EmbedFactory.error("Not Found", f"No {resolved_alert_type} alert found for {normalized_username} on {platform}"),
                 ephemeral=True
             )
             return
 
         embed = EmbedFactory.success(
             "Alert Removed",
-            f"Removed {platform} alert for **{normalized_username}**"
+            f"Removed {resolved_alert_type} {platform} alert for **{normalized_username}**"
         )
         await interaction.response.send_message(embed=embed)
-        if platform == "twitch":
+        if platform == "twitch" and resolved_alert_type == "live":
             await self._reconcile_twitch_eventsub_subscriptions()
-        elif platform == "kick":
+        elif platform == "kick" and resolved_alert_type == "live":
             await self._reconcile_kick_event_subscriptions()
-        logger.info("%s removed %s alert for %s", interaction.user, platform, normalized_username)
+        logger.info("%s removed %s/%s alert for %s", interaction.user, platform, resolved_alert_type, normalized_username)
 
     @alert_group.command(name="list", description="List all social media alerts (Admin)")
     @is_admin()
@@ -3072,16 +3775,17 @@ class SocialAlerts(commands.Cog):
             )
             return
 
-        grouped = {"twitch": [], "youtube": [], "kick": [], "twitter": []}
+        grouped = {"twitch": [], "youtube": [], "kick": [], "instagram": [], "tiktok": [], "twitter": []}
         for alert in alerts:
             platform = alert["platform"]
             if platform in grouped:
                 channel = interaction.guild.get_channel(alert["channel_id"])
+                alert_type = self._get_alert_type(alert)
                 suffix = ""
                 if alert.get("message_template"):
                     suffix = " | custom message"
                 grouped[platform].append(
-                    f"• **{alert['username']}** → {channel.mention if channel else 'Unknown'}{suffix}"
+                    f"• **{alert['username']}** [{alert_type}] → {channel.mention if channel else 'Unknown'}{suffix}"
                 )
 
         description = ""
@@ -3089,6 +3793,8 @@ class SocialAlerts(commands.Cog):
             "twitch": "🟣 **Twitch**",
             "youtube": "🔴 **YouTube**",
             "kick": "🟢 **Kick**",
+            "instagram": "📸 **Instagram**",
+            "tiktok": "🎵 **TikTok**",
             "twitter": "🐦 **Twitter/X**"
         }
 
@@ -3107,36 +3813,40 @@ class SocialAlerts(commands.Cog):
 
     @alert_group.command(name="test", description="Test social media alert (Admin)")
     @app_commands.describe(
-        platform="Platform (twitch/youtube/kick/twitter)",
-        username="Username to test"
+        platform="Platform (twitch/youtube/kick/instagram/tiktok/twitter)",
+        username="Username to test",
+        alert_type="Use live or post. YouTube supports both."
     )
     @is_admin()
     async def test_alert(
         self,
         interaction: discord.Interaction,
         platform: str,
-        username: str
+        username: str,
+        alert_type: Optional[str] = None
     ):
         """Test a social media alert (ADMIN ONLY)"""
         platform = platform.lower()
         if platform not in SUPPORTED_PLATFORMS:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, or twitter"),
+                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, instagram, tiktok, or twitter"),
                 ephemeral=True
             )
+            return
+        resolved_alert_type, type_error = self._normalize_alert_type(platform, alert_type)
+        if not resolved_alert_type:
+            await interaction.response.send_message(embed=EmbedFactory.error("Invalid Alert Type", type_error or "Invalid alert type."), ephemeral=True)
             return
 
         normalized_username = self._normalize_alert_username(platform, username)
 
-        alert = await self.db.db.social_alerts.find_one({
-            "guild_id": interaction.guild.id,
-            "platform": platform,
-            "username": normalized_username
-        })
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, platform, normalized_username, resolved_alert_type)
+        )
 
         if not alert:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not Found", f"No alert found for {normalized_username} on {platform}"),
+                embed=EmbedFactory.error("Not Found", f"No {resolved_alert_type} alert found for {normalized_username} on {platform}"),
                 ephemeral=True
             )
             return
@@ -3148,6 +3858,7 @@ class SocialAlerts(commands.Cog):
                 ephemeral=True
             )
             return
+        stored_alert_type = self._get_alert_type(alert)
 
         if platform == "twitch":
             user, user_error = await self._fetch_twitch_user(normalized_username)
@@ -3242,6 +3953,69 @@ class SocialAlerts(commands.Cog):
             return
 
         if platform == "youtube":
+            if stored_alert_type == "post":
+                channel_data, channel_error = await self._fetch_youtube_channel(
+                    normalized_username,
+                    channel_id=alert.get("youtube_channel_id")
+                )
+                if not channel_data:
+                    await interaction.response.send_message(
+                        embed=EmbedFactory.error("YouTube Lookup Failed", channel_error or "I couldn't resolve that YouTube channel."),
+                        ephemeral=True
+                    )
+                    return
+
+                video, video_error = await self._fetch_youtube_latest_upload(channel_data)
+                if video_error:
+                    await interaction.response.send_message(
+                        embed=EmbedFactory.error("YouTube Check Failed", video_error),
+                        ephemeral=True
+                    )
+                    return
+
+                if not video:
+                    video = {
+                        "id": "preview",
+                        "title": "Latest Upload Preview",
+                        "description": "",
+                        "thumbnail_url": self._get_best_youtube_thumbnail((channel_data.get("snippet") or {}).get("thumbnails")),
+                        "published_at": discord.utils.utcnow().isoformat(),
+                        "url": f"https://youtube.com/channel/{channel_data['id']}"
+                    }
+
+                snippet = channel_data.get("snippet") or {}
+                content = self._render_alert_message(
+                    alert.get("message_template"),
+                    {
+                        "username": normalized_username,
+                        "display_name": snippet.get("title") or normalized_username,
+                        "url": video.get("url"),
+                        "title": video.get("title"),
+                        "platform": "youtube",
+                        "alert_type": "post",
+                        "everyone": "@everyone",
+                        "here": "@here",
+                    }
+                )
+                try:
+                    await channel.send(
+                        content=content,
+                        embed=self._build_youtube_video_embed(video, channel_data),
+                        allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True)
+                    )
+                except discord.HTTPException:
+                    await interaction.response.send_message(
+                        embed=EmbedFactory.error("Send Failed", "I couldn't send the YouTube post test alert to the target channel."),
+                        ephemeral=True
+                    )
+                    return
+
+                await interaction.response.send_message(
+                    embed=EmbedFactory.success("Test Sent", f"YouTube post test notification sent to {channel.mention}."),
+                    ephemeral=True
+                )
+                return
+
             if alert.get("youtube_refresh_token"):
                 video, channel_data, video_error = await self._fetch_youtube_live_video_via_oauth(alert)
                 channel_error = video_error
@@ -3308,37 +4082,158 @@ class SocialAlerts(commands.Cog):
             )
             return
 
+        if platform == "instagram":
+            profile, profile_error = await self._fetch_instagram_profile(alert)
+            if not profile:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("Instagram Lookup Failed", profile_error or "I couldn't resolve that Instagram connection."),
+                    ephemeral=True
+                )
+                return
+            media, media_error = await self._fetch_instagram_latest_media(alert)
+            if media_error:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("Instagram Check Failed", media_error),
+                    ephemeral=True
+                )
+                return
+            if not media:
+                media = {
+                    "id": "preview",
+                    "caption": "Preview post",
+                    "media_url": None,
+                    "thumbnail_url": None,
+                    "permalink": f"https://instagram.com/{profile.get('username', normalized_username)}",
+                    "timestamp": discord.utils.utcnow().isoformat()
+                }
+            content = self._render_alert_message(
+                alert.get("message_template"),
+                {
+                    "username": profile.get("username") or normalized_username,
+                    "display_name": profile.get("name") or profile.get("username") or normalized_username,
+                    "url": media.get("permalink"),
+                    "title": (media.get("caption") or "New Instagram Post")[:120],
+                    "platform": "instagram",
+                    "alert_type": "post",
+                    "everyone": "@everyone",
+                    "here": "@here",
+                }
+            )
+            try:
+                await channel.send(
+                    content=content,
+                    embed=self._build_instagram_post_embed(media, profile),
+                    allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True)
+                )
+            except discord.HTTPException:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("Send Failed", "I couldn't send the Instagram test alert to the target channel."),
+                    ephemeral=True
+                )
+                return
+            await interaction.response.send_message(
+                embed=EmbedFactory.success("Test Sent", f"Instagram post test notification sent to {channel.mention}."),
+                ephemeral=True
+            )
+            return
+
+        if platform == "tiktok":
+            access_token, token_error = await self._get_tiktok_user_access_token(alert)
+            if not access_token:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("TikTok Lookup Failed", token_error or "I couldn't resolve that TikTok connection."),
+                    ephemeral=True
+                )
+                return
+            profile, profile_error = await self._fetch_tiktok_profile(access_token)
+            if not profile:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("TikTok Lookup Failed", profile_error or "I couldn't load the TikTok profile."),
+                    ephemeral=True
+                )
+                return
+            video, video_error = await self._fetch_tiktok_latest_video(access_token)
+            if video_error:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("TikTok Check Failed", video_error),
+                    ephemeral=True
+                )
+                return
+            if not video:
+                video = {
+                    "id": "preview",
+                    "title": "Latest TikTok Preview",
+                    "video_description": "",
+                    "cover_image_url": None,
+                    "share_url": profile.get("profile_deep_link"),
+                    "create_time": int(discord.utils.utcnow().timestamp())
+                }
+            content = self._render_alert_message(
+                alert.get("message_template"),
+                {
+                    "username": normalized_username,
+                    "display_name": profile.get("display_name") or normalized_username,
+                    "url": video.get("share_url") or profile.get("profile_deep_link"),
+                    "title": video.get("title") or "New TikTok Post",
+                    "platform": "tiktok",
+                    "alert_type": "post",
+                    "everyone": "@everyone",
+                    "here": "@here",
+                }
+            )
+            try:
+                await channel.send(
+                    content=content,
+                    embed=self._build_tiktok_post_embed(video, profile),
+                    allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True)
+                )
+            except discord.HTTPException:
+                await interaction.response.send_message(
+                    embed=EmbedFactory.error("Send Failed", "I couldn't send the TikTok test alert to the target channel."),
+                    ephemeral=True
+                )
+                return
+            await interaction.response.send_message(
+                embed=EmbedFactory.success("Test Sent", f"TikTok post test notification sent to {channel.mention}."),
+                ephemeral=True
+            )
+            return
+
     @alert_group.command(name="debug", description="Diagnose a social media alert (Admin)")
     @app_commands.describe(
-        platform="Platform (twitch/youtube/kick/twitter)",
-        username="Username to diagnose"
+        platform="Platform (twitch/youtube/kick/instagram/tiktok/twitter)",
+        username="Username to diagnose",
+        alert_type="Use live or post. YouTube supports both."
     )
     @is_admin()
     async def debug_alert(
         self,
         interaction: discord.Interaction,
         platform: str,
-        username: str
+        username: str,
+        alert_type: Optional[str] = None
     ):
         """Diagnose why an alert is or is not firing."""
         platform = platform.lower()
         if platform not in SUPPORTED_PLATFORMS:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, or twitter"),
+                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, instagram, tiktok, or twitter"),
                 ephemeral=True
             )
+            return
+        resolved_alert_type, type_error = self._normalize_alert_type(platform, alert_type)
+        if not resolved_alert_type:
+            await interaction.response.send_message(embed=EmbedFactory.error("Invalid Alert Type", type_error or "Invalid alert type."), ephemeral=True)
             return
 
         normalized_username = self._normalize_alert_username(platform, username)
 
-        alert = await self.db.db.social_alerts.find_one({
-            "guild_id": interaction.guild.id,
-            "platform": platform,
-            "username": normalized_username
-        })
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, platform, normalized_username, resolved_alert_type)
+        )
         if not alert:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not Found", f"No alert found for {normalized_username} on {platform}"),
+                embed=EmbedFactory.error("Not Found", f"No {resolved_alert_type} alert found for {normalized_username} on {platform}"),
                 ephemeral=True
             )
             return
@@ -3346,8 +4241,9 @@ class SocialAlerts(commands.Cog):
         channel = interaction.guild.get_channel(alert["channel_id"])
         fields = [
             {"name": "Platform", "value": platform, "inline": True},
+            {"name": "Type", "value": resolved_alert_type, "inline": True},
             {"name": "Username", "value": alert["username"], "inline": True},
-            {"name": "Channel", "value": channel.mention if channel else "Missing", "inline": True},
+            {"name": "Channel", "value": channel.mention if channel else "Missing", "inline": False},
             {"name": "Last Status", "value": alert.get("last_check_status", "Never checked"), "inline": False},
             {"name": "Last Error", "value": alert.get("last_check_error") or "None", "inline": False}
         ]
@@ -3526,35 +4422,39 @@ class SocialAlerts(commands.Cog):
 
     @alert_group.command(name="run", description="Run a social media alert check immediately (Admin)")
     @app_commands.describe(
-        platform="Platform (twitch/youtube/kick/twitter)",
-        username="Username to check now"
+        platform="Platform (twitch/youtube/kick/instagram/tiktok/twitter)",
+        username="Username to check now",
+        alert_type="Use live or post. YouTube supports both."
     )
     @is_admin()
     async def run_alert(
         self,
         interaction: discord.Interaction,
         platform: str,
-        username: str
+        username: str,
+        alert_type: Optional[str] = None
     ):
         """Force an alert check immediately."""
         platform = platform.lower()
         if platform not in SUPPORTED_PLATFORMS:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, or twitter"),
+                embed=EmbedFactory.error("Invalid Platform", "Platform must be twitch, youtube, kick, instagram, tiktok, or twitter"),
                 ephemeral=True
             )
+            return
+        resolved_alert_type, type_error = self._normalize_alert_type(platform, alert_type)
+        if not resolved_alert_type:
+            await interaction.response.send_message(embed=EmbedFactory.error("Invalid Alert Type", type_error or "Invalid alert type."), ephemeral=True)
             return
 
         normalized_username = self._normalize_alert_username(platform, username)
 
-        alert = await self.db.db.social_alerts.find_one({
-            "guild_id": interaction.guild.id,
-            "platform": platform,
-            "username": normalized_username
-        })
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, platform, normalized_username, resolved_alert_type)
+        )
         if not alert:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not Found", f"No alert found for {normalized_username} on {platform}"),
+                embed=EmbedFactory.error("Not Found", f"No {resolved_alert_type} alert found for {normalized_username} on {platform}"),
                 ephemeral=True
             )
             return
@@ -3567,7 +4467,7 @@ class SocialAlerts(commands.Cog):
         error = refreshed.get("last_check_error") or "None"
         embed = EmbedFactory.success(
             "Alert Check Complete",
-            f"Ran an immediate check for **{normalized_username}** on **{platform}**.\n\n"
+            f"Ran an immediate {resolved_alert_type} check for **{normalized_username}** on **{platform}**.\n\n"
             f"**Last Status:** {status}\n"
             f"**Last Error:** {error}"
         )
@@ -3593,14 +4493,12 @@ class SocialAlerts(commands.Cog):
             return
 
         normalized_username = self._normalize_alert_username("youtube", username)
-        alert = await self.db.db.social_alerts.find_one({
-            "guild_id": interaction.guild.id,
-            "platform": "youtube",
-            "username": normalized_username
-        })
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, "youtube", normalized_username, "live")
+        )
         if not alert:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not Found", f"No YouTube alert found for {normalized_username}."),
+                embed=EmbedFactory.error("Not Found", f"No YouTube live alert found for {normalized_username}."),
                 ephemeral=True
             )
             return
@@ -3661,14 +4559,12 @@ class SocialAlerts(commands.Cog):
     ):
         """Remove stored YouTube owner OAuth tokens from an alert."""
         normalized_username = self._normalize_alert_username("youtube", username)
-        alert = await self.db.db.social_alerts.find_one({
-            "guild_id": interaction.guild.id,
-            "platform": "youtube",
-            "username": normalized_username
-        })
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, "youtube", normalized_username, "live")
+        )
         if not alert:
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not Found", f"No YouTube alert found for {normalized_username}."),
+                embed=EmbedFactory.error("Not Found", f"No YouTube live alert found for {normalized_username}."),
                 ephemeral=True
             )
             return
@@ -3688,6 +4584,164 @@ class SocialAlerts(commands.Cog):
                 "YouTube OAuth Disconnected",
                 f"Removed the optional owner OAuth path from the YouTube alert for **{normalized_username}**. Public polling remains available."
             ),
+            ephemeral=True
+        )
+
+    @alert_group.command(name="tiktok-connect", description="Generate a TikTok OAuth link for a TikTok post alert (Admin)")
+    @app_commands.describe(username="TikTok username to connect to the alert")
+    @is_admin()
+    async def tiktok_connect(self, interaction: discord.Interaction, username: str):
+        """Generate a TikTok OAuth link for a post alert."""
+        if not self._tiktok_oauth_is_configured():
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "TikTok OAuth Not Configured",
+                    "Set `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`, and a public HTTPS callback URL first."
+                ),
+                ephemeral=True
+            )
+            return
+
+        normalized_username = self._normalize_alert_username("tiktok", username)
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, "tiktok", normalized_username, "post")
+        )
+        if not alert:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Not Found", f"No TikTok post alert found for {normalized_username}."),
+                ephemeral=True
+            )
+            return
+
+        state = await self._create_oauth_state(
+            platform="tiktok",
+            alert_id=alert["_id"],
+            guild_id=interaction.guild.id,
+            username=normalized_username
+        )
+        client_key, _ = self._get_tiktok_oauth_credentials()
+        redirect_uri = self._get_tiktok_oauth_redirect_uri()
+        auth_query = urlencode({
+            "client_key": client_key,
+            "response_type": "code",
+            "scope": ",".join(TIKTOK_OAUTH_SCOPES),
+            "redirect_uri": redirect_uri,
+            "state": state,
+        })
+        auth_url = f"https://www.tiktok.com/v2/auth/authorize/?{auth_query}"
+        await interaction.response.send_message(
+            embed=EmbedFactory.info(
+                "TikTok OAuth Link Ready",
+                "Open this link with the TikTok account that owns the target profile:\n\n"
+                f"{auth_url}\n\n"
+                "Once connected, the bot can poll that account's recent videos and announce new uploads."
+            ),
+            ephemeral=True
+        )
+
+    @alert_group.command(name="tiktok-disconnect", description="Disconnect a TikTok post alert from its OAuth account (Admin)")
+    @app_commands.describe(username="TikTok username to disconnect")
+    @is_admin()
+    async def tiktok_disconnect(self, interaction: discord.Interaction, username: str):
+        """Disconnect a TikTok post alert."""
+        normalized_username = self._normalize_alert_username("tiktok", username)
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, "tiktok", normalized_username, "post")
+        )
+        if not alert:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Not Found", f"No TikTok post alert found for {normalized_username}."),
+                ephemeral=True
+            )
+            return
+
+        await self.db.db.social_alerts.update_one(
+            {"_id": alert["_id"]},
+            {"$unset": {
+                "tiktok_access_token": "",
+                "tiktok_access_token_expires_at": "",
+                "tiktok_refresh_token": "",
+                "tiktok_refresh_expires_at": "",
+                "tiktok_open_id": "",
+                "tiktok_display_name": "",
+                "tiktok_profile_deep_link": "",
+                "tiktok_avatar_url": "",
+                "tiktok_connected_at": "",
+            }}
+        )
+        await interaction.response.send_message(
+            embed=EmbedFactory.success("TikTok Disconnected", f"Disconnected the TikTok post alert for **{normalized_username}**."),
+            ephemeral=True
+        )
+
+    @alert_group.command(name="instagram-connect-manual", description="Store Instagram credentials for an Instagram post alert (Admin)")
+    @app_commands.describe(
+        username="Instagram username to connect",
+        instagram_user_id="Instagram professional account ID",
+        access_token="Instagram user access token for that account"
+    )
+    @is_admin()
+    async def instagram_connect_manual(
+        self,
+        interaction: discord.Interaction,
+        username: str,
+        instagram_user_id: str,
+        access_token: str
+    ):
+        """Store Instagram credentials for a post alert."""
+        normalized_username = self._normalize_alert_username("instagram", username)
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, "instagram", normalized_username, "post")
+        )
+        if not alert:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Not Found", f"No Instagram post alert found for {normalized_username}."),
+                ephemeral=True
+            )
+            return
+
+        await self.db.db.social_alerts.update_one(
+            {"_id": alert["_id"]},
+            {"$set": {
+                "instagram_user_id": instagram_user_id.strip(),
+                "instagram_access_token": access_token.strip(),
+                "instagram_connected_at": discord.utils.utcnow().timestamp()
+            }}
+        )
+        await interaction.response.send_message(
+            embed=EmbedFactory.success(
+                "Instagram Connected",
+                f"Stored manual Instagram credentials for **{normalized_username}**. The next alert check will use them."
+            ),
+            ephemeral=True
+        )
+
+    @alert_group.command(name="instagram-disconnect", description="Remove stored Instagram credentials from an alert (Admin)")
+    @app_commands.describe(username="Instagram username to disconnect")
+    @is_admin()
+    async def instagram_disconnect(self, interaction: discord.Interaction, username: str):
+        """Disconnect an Instagram post alert."""
+        normalized_username = self._normalize_alert_username("instagram", username)
+        alert = await self.db.db.social_alerts.find_one(
+            self._build_alert_lookup_query(interaction.guild.id, "instagram", normalized_username, "post")
+        )
+        if not alert:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Not Found", f"No Instagram post alert found for {normalized_username}."),
+                ephemeral=True
+            )
+            return
+
+        await self.db.db.social_alerts.update_one(
+            {"_id": alert["_id"]},
+            {"$unset": {
+                "instagram_user_id": "",
+                "instagram_access_token": "",
+                "instagram_connected_at": ""
+            }}
+        )
+        await interaction.response.send_message(
+            embed=EmbedFactory.success("Instagram Disconnected", f"Disconnected the Instagram post alert for **{normalized_username}**."),
             ephemeral=True
         )
 

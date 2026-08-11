@@ -5,7 +5,7 @@ bot:
   token: "${DISCORD_BOT_TOKEN}"
   prefix: "/"  # Slash commands only
   status: "online"
-  activity: "GUARDIAN OF THE SQUAD & HIDEOUT"
+  activity: "GUARDIAN OF THE IPS & HIDEOUT"
   activity_type: "watching"  # playing, watching, listening, streaming
 
 database:
@@ -102,5 +102,7 @@ api_keys:
   youtube_oauth_client_secret: ""
   kick_client_id: ""
   kick_client_secret: ""
+  tiktok_client_key: ""
+  tiktok_client_secret: ""
   spotify_client_id: ""
   spotify_client_secret: ""

@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 TWITCH_EVENTSUB_PATH = "/webhooks/twitch/eventsub"
 KICK_EVENTS_PATH = "/webhooks/kick/events"
 YOUTUBE_OAUTH_CALLBACK_PATH = "/oauth/youtube/callback"
+TIKTOK_OAUTH_CALLBACK_PATH = "/oauth/tiktok/callback"
 
 
 def parse_rfc3339_timestamp(timestamp: str) -> datetime | None:
@@ -396,6 +397,33 @@ def create_app(bot) -> FastAPI:
             raise HTTPException(status_code=503, detail="Social alerts cog is not loaded")
 
         title, message = await social_alerts.handle_youtube_oauth_callback(
+            state=state or "",
+            code=code,
+            error=error
+        )
+        return f"""
+        <html>
+            <head><title>{title}</title></head>
+            <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto; line-height: 1.5;">
+                <h1>{title}</h1>
+                <p>{message}</p>
+                <p>You can close this page and return to Discord.</p>
+            </body>
+        </html>
+        """
+
+    @app.get(TIKTOK_OAUTH_CALLBACK_PATH, response_class=HTMLResponse)
+    async def tiktok_oauth_callback(
+        state: Optional[str] = None,
+        code: Optional[str] = None,
+        error: Optional[str] = None,
+    ):
+        """Complete the TikTok OAuth flow for social alerts."""
+        social_alerts = bot.get_cog("SocialAlerts")
+        if social_alerts is None:
+            raise HTTPException(status_code=503, detail="Social alerts cog is not loaded")
+
+        title, message = await social_alerts.handle_tiktok_oauth_callback(
             state=state or "",
             code=code,
             error=error
