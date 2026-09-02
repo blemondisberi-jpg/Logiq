@@ -149,6 +149,7 @@ class Music(commands.Cog):
         self.module_config = config.get('modules', {}).get('music', {})
         self.queues = {}  # guild_id: MusicQueue
         self.volumes = {}  # guild_id: float
+        self.playback_locks = {}  # guild_id: asyncio.Lock
 
     def _is_enabled(self) -> bool:
         """Whether music commands should be active."""
@@ -212,6 +213,12 @@ class Music(commands.Cog):
         if guild_id not in self.queues:
             self.queues[guild_id] = MusicQueue()
         return self.queues[guild_id]
+
+    def get_playback_lock(self, guild_id: int) -> asyncio.Lock:
+        """Get or create a per-guild playback lock."""
+        if guild_id not in self.playback_locks:
+            self.playback_locks[guild_id] = asyncio.Lock()
+        return self.playback_locks[guild_id]
 
     async def _extract_track(self, query: str, requester: discord.Member) -> dict:
         """Resolve a search query or URL into a playable audio stream."""
@@ -308,8 +315,17 @@ class Music(commands.Cog):
             return voice_client
 
         try:
-            return await voice_state.channel.connect()
+            voice_client = await voice_state.channel.connect(reconnect=False, timeout=20.0)
+            logger.info("Music voice connected in guild %s to channel %s", interaction.guild.id, voice_state.channel.id)
+            return voice_client
         except Exception as error:
+            logger.error(
+                "Music voice connection failed in guild %s to channel %s: %s",
+                interaction.guild.id,
+                voice_state.channel.id,
+                error,
+                exc_info=True
+            )
             sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
             await sender(
                 embed=EmbedFactory.error("Connection Failed", f"Could not join voice channel: {error}"),
@@ -335,42 +351,97 @@ class Music(commands.Cog):
 
     async def _play_next(self, guild_id: int) -> None:
         """Start the next queued track, disconnecting when the queue is empty."""
-        guild = self.bot.get_guild(guild_id)
-        if guild is None or guild.voice_client is None:
-            return
+        async with self.get_playback_lock(guild_id):
+            guild = self.bot.get_guild(guild_id)
+            if guild is None or guild.voice_client is None:
+                return
 
-        queue = self.get_queue(guild_id)
-        track = queue.next()
-        if not track:
-            queue.current = None
-            return
+            voice_client = guild.voice_client
+            if not voice_client.is_connected():
+                logger.warning("Music playback requested in guild %s but voice client is disconnected", guild_id)
+                return
 
-        source = discord.FFmpegPCMAudio(
-            track["stream_url"],
-            before_options=FFMPEG_BEFORE_OPTIONS,
-            options=FFMPEG_OPTIONS
-        )
-        audio = discord.PCMVolumeTransformer(source, volume=self._get_volume(guild_id))
+            if voice_client.is_playing() or voice_client.is_paused():
+                return
 
-        def after_play(error: Optional[Exception]) -> None:
-            if error:
-                logger.error(
-                    "Music playback error in guild %s: %s",
-                    guild_id,
-                    error,
-                    exc_info=(type(error), error, error.__traceback__)
+            queue = self.get_queue(guild_id)
+            track = queue.next()
+            if not track:
+                queue.current = None
+                logger.info("Music queue empty in guild %s", guild_id)
+                return
+
+            try:
+                source = discord.FFmpegPCMAudio(
+                    track["stream_url"],
+                    before_options=FFMPEG_BEFORE_OPTIONS,
+                    options=FFMPEG_OPTIONS
                 )
-            future = asyncio.run_coroutine_threadsafe(self._play_next(guild_id), self.bot.loop)
-            future.add_done_callback(
-                lambda completed: logger.error(
-                    "Failed to continue music queue in guild %s: %s",
+                audio = discord.PCMVolumeTransformer(source, volume=self._get_volume(guild_id))
+            except Exception as error:
+                queue.current = None
+                logger.error(
+                    "Failed to create FFmpeg audio source in guild %s for %s: %s",
                     guild_id,
-                    completed.exception(),
-                    exc_info=completed.exception()
-                ) if completed.exception() else None
-            )
+                    track.get("webpage_url") or track.get("title"),
+                    error,
+                    exc_info=True
+                )
+                return
 
-        guild.voice_client.play(audio, after=after_play)
+            def after_play(error: Optional[Exception]) -> None:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._handle_track_finished(guild_id, track, error),
+                    self.bot.loop
+                )
+                future.add_done_callback(
+                    lambda completed: logger.error(
+                        "Failed to finish music queue step in guild %s: %s",
+                        guild_id,
+                        completed.exception(),
+                        exc_info=completed.exception()
+                    ) if completed.exception() else None
+                )
+
+            try:
+                voice_client.play(audio, after=after_play)
+                logger.info(
+                    "Music playback started in guild %s: %s (%s)",
+                    guild_id,
+                    track.get("title"),
+                    track.get("webpage_url")
+                )
+            except Exception as error:
+                queue.current = None
+                logger.error(
+                    "Failed to start music playback in guild %s for %s: %s",
+                    guild_id,
+                    track.get("webpage_url") or track.get("title"),
+                    error,
+                    exc_info=True
+                )
+
+    async def _handle_track_finished(
+        self,
+        guild_id: int,
+        track: dict,
+        error: Optional[Exception]
+    ) -> None:
+        """Handle FFmpeg completion and advance the queue once."""
+        queue = self.get_queue(guild_id)
+        if error:
+            logger.error(
+                "Music playback failed in guild %s for %s: %s",
+                guild_id,
+                track.get("webpage_url") or track.get("title"),
+                error,
+                exc_info=(type(error), error, error.__traceback__)
+            )
+        else:
+            logger.info("Music playback finished in guild %s: %s", guild_id, track.get("title"))
+
+        queue.current = None
+        await self._play_next(guild_id)
 
     async def _start_playback_if_idle(self, guild_id: int) -> None:
         """Kick the queue if the voice client is idle."""
@@ -387,6 +458,21 @@ class Music(commands.Cog):
     async def play(self, interaction: discord.Interaction, query: str):
         """Play music from YouTube"""
         if not await self._guard_enabled(interaction):
+            return
+
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Server Only", "Music commands can only be used inside a server."),
+                ephemeral=True
+            )
+            return
+
+        voice_state = getattr(interaction.user, "voice", None)
+        if not voice_state or not voice_state.channel:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Not in Voice", "You must be in a voice channel to use this command"),
+                ephemeral=True
+            )
             return
 
         if not self._ffmpeg_available():
@@ -410,6 +496,13 @@ class Music(commands.Cog):
                 ephemeral=True
             )
             return
+        logger.info(
+            "Music track resolved in guild %s by %s: %s (%s)",
+            interaction.guild.id,
+            interaction.user,
+            track.get("title"),
+            track.get("webpage_url")
+        )
 
         voice_client = await self._ensure_voice_client(interaction)
         if voice_client is None:
