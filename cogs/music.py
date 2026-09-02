@@ -9,12 +9,28 @@ from discord.ext import commands
 from typing import Optional
 import logging
 import asyncio
+import functools
+import shutil
+
+import yt_dlp
 
 from utils.embeds import EmbedFactory, EmbedColor
 from utils.permissions import is_admin
 from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
+
+YTDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "default_search": "ytsearch",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "extract_flat": False,
+    "source_address": "0.0.0.0"
+}
+FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+FFMPEG_OPTIONS = "-vn"
 
 
 class MusicQueue:
@@ -42,14 +58,6 @@ class MusicQueue:
         """Clear queue"""
         self.queue = []
         self.current = None
-        
-    def skip(self):
-        """Skip current track"""
-        if self.queue:
-            self.current = self.queue.pop(0)
-            return self.current
-        return None
-
 
 class MusicControlView(discord.ui.View):
     """Music player controls"""
@@ -135,6 +143,34 @@ class Music(commands.Cog):
         self.config = config
         self.module_config = config.get('modules', {}).get('music', {})
         self.queues = {}  # guild_id: MusicQueue
+        self.volumes = {}  # guild_id: float
+        self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+
+    def _is_enabled(self) -> bool:
+        """Whether music commands should be active."""
+        return self.module_config.get('enabled', True)
+
+    async def _guard_enabled(self, interaction: discord.Interaction) -> bool:
+        """Send a clear response when music is disabled."""
+        if self._is_enabled():
+            return True
+
+        await interaction.response.send_message(
+            embed=EmbedFactory.error(
+                "Music Disabled",
+                "The music module is currently disabled in the bot configuration."
+            ),
+            ephemeral=True
+        )
+        return False
+
+    def _ffmpeg_available(self) -> bool:
+        """Check whether FFmpeg is available on the host."""
+        return shutil.which("ffmpeg") is not None
+
+    def _get_volume(self, guild_id: int) -> float:
+        """Return saved guild volume as a 0.0-1.0 value."""
+        return self.volumes.get(guild_id, 0.5)
 
     def get_queue(self, guild_id: int) -> MusicQueue:
         """Get or create queue for guild"""
@@ -142,68 +178,206 @@ class Music(commands.Cog):
             self.queues[guild_id] = MusicQueue()
         return self.queues[guild_id]
 
+    async def _extract_track(self, query: str, requester: discord.Member) -> dict:
+        """Resolve a search query or URL into a playable audio stream."""
+        loop = self.bot.loop
+        extractor = functools.partial(self.ytdl.extract_info, query, download=False)
+        data = await loop.run_in_executor(None, extractor)
+
+        if "entries" in data:
+            entries = [entry for entry in data.get("entries", []) if entry]
+            if not entries:
+                raise ValueError("No playable results were found for that search.")
+            data = entries[0]
+
+        stream_url = data.get("url")
+        if not stream_url:
+            raise ValueError("I couldn't resolve that track into a playable audio stream.")
+
+        return {
+            "title": data.get("title") or query,
+            "stream_url": stream_url,
+            "webpage_url": data.get("webpage_url") or data.get("original_url") or query,
+            "duration": data.get("duration"),
+            "thumbnail": data.get("thumbnail"),
+            "requester_id": requester.id,
+            "requester_name": requester.display_name
+        }
+
+    async def _ensure_voice_client(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
+        """Join or move to the requester's voice channel."""
+        if interaction.guild is None:
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
+                embed=EmbedFactory.error("Server Only", "Music commands can only be used inside a server."),
+                ephemeral=True
+            )
+            return None
+
+        voice_state = getattr(interaction.user, "voice", None)
+        if not voice_state or not voice_state.channel:
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
+                embed=EmbedFactory.error("Not in Voice", "You must be in a voice channel to use this command"),
+                ephemeral=True
+            )
+            return None
+
+        voice_client = interaction.guild.voice_client
+        if voice_client and voice_client.channel != voice_state.channel:
+            await voice_client.move_to(voice_state.channel)
+            return voice_client
+
+        if voice_client:
+            return voice_client
+
+        try:
+            return await voice_state.channel.connect()
+        except Exception as error:
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
+                embed=EmbedFactory.error("Connection Failed", f"Could not join voice channel: {error}"),
+                ephemeral=True
+            )
+            return None
+
+    def _format_duration(self, seconds: Optional[int]) -> str:
+        """Format a track duration for embeds."""
+        if not seconds:
+            return "Live or unknown length"
+        minutes, secs = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+
+    def _track_label(self, track: dict) -> str:
+        """Format a track title with a link when available."""
+        title = discord.utils.escape_markdown(str(track.get("title") or "Unknown track"))
+        url = track.get("webpage_url")
+        return f"[{title}]({url})" if url else title
+
+    async def _play_next(self, guild_id: int) -> None:
+        """Start the next queued track, disconnecting when the queue is empty."""
+        guild = self.bot.get_guild(guild_id)
+        if guild is None or guild.voice_client is None:
+            return
+
+        queue = self.get_queue(guild_id)
+        track = queue.next()
+        if not track:
+            queue.current = None
+            return
+
+        source = discord.FFmpegPCMAudio(
+            track["stream_url"],
+            before_options=FFMPEG_BEFORE_OPTIONS,
+            options=FFMPEG_OPTIONS
+        )
+        audio = discord.PCMVolumeTransformer(source, volume=self._get_volume(guild_id))
+
+        def after_play(error: Optional[Exception]) -> None:
+            if error:
+                logger.error(
+                    "Music playback error in guild %s: %s",
+                    guild_id,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__)
+                )
+            future = asyncio.run_coroutine_threadsafe(self._play_next(guild_id), self.bot.loop)
+            future.add_done_callback(
+                lambda completed: logger.error(
+                    "Failed to continue music queue in guild %s: %s",
+                    guild_id,
+                    completed.exception(),
+                    exc_info=completed.exception()
+                ) if completed.exception() else None
+            )
+
+        guild.voice_client.play(audio, after=after_play)
+
+    async def _start_playback_if_idle(self, guild_id: int) -> None:
+        """Kick the queue if the voice client is idle."""
+        guild = self.bot.get_guild(guild_id)
+        if not guild or not guild.voice_client:
+            return
+
+        voice_client = guild.voice_client
+        if not voice_client.is_playing() and not voice_client.is_paused():
+            await self._play_next(guild_id)
+
     @app_commands.command(name="play", description="Play music from YouTube")
     @app_commands.describe(query="Song name or YouTube URL")
     async def play(self, interaction: discord.Interaction, query: str):
         """Play music from YouTube"""
-        # Check if user is in voice channel
-        if not interaction.user.voice:
+        if not await self._guard_enabled(interaction):
+            return
+
+        if not self._ffmpeg_available():
             await interaction.response.send_message(
-                embed=EmbedFactory.error("Not in Voice", "You must be in a voice channel to use this command"),
+                embed=EmbedFactory.error(
+                    "FFmpeg Missing",
+                    "Music playback needs FFmpeg installed on the host. Railway will install it from `nixpacks.toml` after the next deploy."
+                ),
                 ephemeral=True
             )
             return
 
         await interaction.response.defer()
 
-        # Check if bot is in voice
-        if not interaction.guild.voice_client:
-            try:
-                await interaction.user.voice.channel.connect()
-            except Exception as e:
-                await interaction.followup.send(
-                    embed=EmbedFactory.error("Connection Failed", f"Could not join voice channel: {str(e)}"),
-                    ephemeral=True
-                )
-                return
+        voice_client = await self._ensure_voice_client(interaction)
+        if voice_client is None:
+            return
 
-        # Add to queue
-        queue = self.get_queue(interaction.guild.id)
-        queue.add(query)
-        
-        embed = EmbedFactory.success(
-            "Added to Queue",
-            f"**Track:** {query}\n"
-            f"**Requested by:** {interaction.user.mention}\n"
-            f"**Position in queue:** {len(queue.queue)}"
-        )
-        
-        await interaction.followup.send(embed=embed)
-        logger.info(f"Added to queue by {interaction.user}: {query}")
-
-    @app_commands.command(name="join", description="Join your voice channel")
-    async def join(self, interaction: discord.Interaction):
-        """Join voice channel"""
-        if not interaction.user.voice:
-            await interaction.response.send_message(
-                embed=EmbedFactory.error("Not in Voice", "You must be in a voice channel"),
+        try:
+            track = await self._extract_track(query, interaction.user)
+        except Exception as error:
+            logger.error("Failed to resolve music query %s: %s", query, error, exc_info=True)
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Track Not Found", str(error)),
                 ephemeral=True
             )
             return
 
-        channel = interaction.user.voice.channel
-        
-        if interaction.guild.voice_client:
-            await interaction.guild.voice_client.move_to(channel)
-        else:
-            await channel.connect()
+        # Add to queue
+        queue = self.get_queue(interaction.guild.id)
+        was_idle = not voice_client.is_playing() and not voice_client.is_paused() and queue.current is None
+        queue.add(track)
 
-        embed = EmbedFactory.success("Joined", f"Joined {channel.mention}")
-        await interaction.response.send_message(embed=embed)
+        embed = EmbedFactory.success(
+            "Now Playing" if was_idle else "Added to Queue",
+            f"**Track:** {self._track_label(track)}\n"
+            f"**Duration:** {self._format_duration(track.get('duration'))}\n"
+            f"**Requested by:** {interaction.user.mention}\n"
+            f"**Position in queue:** {1 if was_idle else len(queue.queue)}"
+        )
+        if track.get("thumbnail"):
+            embed.set_thumbnail(url=track["thumbnail"])
+
+        await interaction.followup.send(embed=embed, view=MusicControlView(self))
+        await self._start_playback_if_idle(interaction.guild.id)
+        logger.info("Added music track by %s: %s", interaction.user, track["title"])
+
+    @app_commands.command(name="join", description="Join your voice channel")
+    async def join(self, interaction: discord.Interaction):
+        """Join voice channel"""
+        if not await self._guard_enabled(interaction):
+            return
+
+        voice_client = await self._ensure_voice_client(interaction)
+        if voice_client is None:
+            return
+
+        embed = EmbedFactory.success("Joined", f"Joined {voice_client.channel.mention}")
+        sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+        await sender(embed=embed)
 
     @app_commands.command(name="leave", description="Leave voice channel")
     async def leave(self, interaction: discord.Interaction):
         """Leave voice channel"""
+        if not await self._guard_enabled(interaction):
+            return
+
         if not interaction.guild.voice_client:
             await interaction.response.send_message(
                 embed=EmbedFactory.error("Not Connected", "I'm not in a voice channel"),
@@ -222,6 +396,9 @@ class Music(commands.Cog):
     @app_commands.command(name="queue", description="View music queue")
     async def view_queue(self, interaction: discord.Interaction):
         """View music queue"""
+        if not await self._guard_enabled(interaction):
+            return
+
         guild_id = interaction.guild.id
         queue = self.get_queue(guild_id)
 
@@ -234,12 +411,12 @@ class Music(commands.Cog):
 
         description = ""
         if queue.current:
-            description += f"**Now Playing:**\n{queue.current}\n\n"
+            description += f"**Now Playing:**\n{self._track_label(queue.current)}\n\n"
 
         if queue.queue:
             description += "**Up Next:**\n"
             for i, track in enumerate(queue.queue[:10], 1):
-                description += f"{i}. {track}\n"
+                description += f"{i}. {self._track_label(track)}\n"
 
         embed = EmbedFactory.create(
             title="🎵 Music Queue",
@@ -252,6 +429,9 @@ class Music(commands.Cog):
     @app_commands.command(name="skip", description="Skip current track")
     async def skip(self, interaction: discord.Interaction):
         """Skip current track"""
+        if not await self._guard_enabled(interaction):
+            return
+
         if not interaction.guild.voice_client:
             await interaction.response.send_message(
                 embed=EmbedFactory.error("Not Playing", "No music is playing"),
@@ -273,6 +453,9 @@ class Music(commands.Cog):
     @app_commands.command(name="pause", description="Pause music")
     async def pause(self, interaction: discord.Interaction):
         """Pause music"""
+        if not await self._guard_enabled(interaction):
+            return
+
         if not interaction.guild.voice_client:
             await interaction.response.send_message(
                 embed=EmbedFactory.error("Not Playing", "No music is playing"),
@@ -294,6 +477,9 @@ class Music(commands.Cog):
     @app_commands.command(name="resume", description="Resume music")
     async def resume(self, interaction: discord.Interaction):
         """Resume music"""
+        if not await self._guard_enabled(interaction):
+            return
+
         if not interaction.guild.voice_client:
             await interaction.response.send_message(
                 embed=EmbedFactory.error("Not Playing", "No music is paused"),
@@ -317,6 +503,9 @@ class Music(commands.Cog):
     @is_admin()
     async def volume(self, interaction: discord.Interaction, volume: int):
         """Set volume"""
+        if not await self._guard_enabled(interaction):
+            return
+
         if volume < 0 or volume > 100:
             await interaction.response.send_message(
                 embed=EmbedFactory.error("Invalid Volume", "Volume must be between 0 and 100"),
@@ -331,13 +520,22 @@ class Music(commands.Cog):
             )
             return
 
-        # Note: Volume control requires proper audio source implementation
+        guild_id = interaction.guild.id
+        self.volumes[guild_id] = volume / 100
+
+        source = getattr(interaction.guild.voice_client, "source", None)
+        if isinstance(source, discord.PCMVolumeTransformer):
+            source.volume = self._get_volume(guild_id)
+
         embed = EmbedFactory.success("Volume", f"Volume set to {volume}%")
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="nowplaying", description="Show currently playing track")
     async def nowplaying(self, interaction: discord.Interaction):
         """Show currently playing track"""
+        if not await self._guard_enabled(interaction):
+            return
+
         guild_id = interaction.guild.id
         queue = self.get_queue(guild_id)
 
@@ -350,9 +548,15 @@ class Music(commands.Cog):
 
         embed = EmbedFactory.create(
             title="🎵 Now Playing",
-            description=queue.current,
+            description=(
+                f"**Track:** {self._track_label(queue.current)}\n"
+                f"**Duration:** {self._format_duration(queue.current.get('duration'))}\n"
+                f"**Requested by:** {queue.current.get('requester_name', 'Unknown')}"
+            ),
             color=EmbedColor.INFO
         )
+        if queue.current.get("thumbnail"):
+            embed.set_thumbnail(url=queue.current["thumbnail"])
 
         await interaction.response.send_message(embed=embed)
 
