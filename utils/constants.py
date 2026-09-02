@@ -40,7 +40,8 @@ LEVELING = {
 
 def calculate_level_xp(level: int) -> int:
     """Calculate XP required for level"""
-    return int(LEVELING["base_xp"] * (level ** LEVELING["xp_multiplier"]))
+    safe_level = max(1, int(level))
+    return int(LEVELING["base_xp"] * (safe_level ** LEVELING["xp_multiplier"]))
 
 # Economy Constants
 ECONOMY = {

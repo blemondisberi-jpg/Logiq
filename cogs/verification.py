@@ -332,6 +332,25 @@ class Verification(commands.Cog):
         else:
             await interaction.response.send_message(**response_kwargs)
 
+    async def _defer_interaction_if_needed(
+        self,
+        interaction: discord.Interaction,
+        *,
+        ephemeral: bool = True,
+        thinking: bool = True
+    ) -> None:
+        """Acknowledge slow verification interactions before Discord's timeout."""
+        if interaction.response.is_done():
+            return
+
+        try:
+            if interaction.guild is None:
+                await interaction.response.defer(thinking=thinking)
+            else:
+                await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+        except discord.HTTPException as error:
+            logger.warning("Failed to defer verification interaction %s: %s", interaction.id, error)
+
     def _get_verification_mode(self, guild_config: dict) -> str:
         """Get the current verification mode used after a member accepts rules."""
         mode = (
@@ -1032,6 +1051,7 @@ class Verification(commands.Cog):
 
     async def handle_rules_accept(self, interaction: discord.Interaction) -> None:
         """Route rules acceptance into instant verification or DM captcha."""
+        await self._defer_interaction_if_needed(interaction)
         guild, member, guild_config = await self._resolve_verification_context(interaction)
         if guild is None or guild_config is None or member is None:
             await self._send_interaction_embed(
@@ -1786,6 +1806,7 @@ class Verification(commands.Cog):
         guild_id: Optional[int] = None
     ):
         """Verify a user and assign role (SILENT - no public announcements)"""
+        await self._defer_interaction_if_needed(interaction)
         guild, member, guild_config = await self._resolve_verification_context(interaction, guild_id)
         if guild is None or member is None or guild_config is None:
             await self._send_interaction_embed(
@@ -1935,6 +1956,7 @@ class Verification(commands.Cog):
         guild_id: Optional[int] = None
     ) -> None:
         """Validate a selected streaming profile, then complete platform-based verification."""
+        await self._defer_interaction_if_needed(interaction)
         guild, member, guild_config = await self._resolve_verification_context(interaction, guild_id)
         if guild is None or member is None or guild_config is None:
             await self._send_interaction_embed(
