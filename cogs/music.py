@@ -36,6 +36,7 @@ YTDL_OPTIONS = {
 DEFAULT_YOUTUBE_PLAYER_CLIENTS = ("tv", "web_safari", "android")
 FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
+VOICE_CONNECT_COOLDOWN_SECONDS = 45
 
 
 class MusicQueue:
@@ -150,6 +151,7 @@ class Music(commands.Cog):
         self.queues = {}  # guild_id: MusicQueue
         self.volumes = {}  # guild_id: float
         self.playback_locks = {}  # guild_id: asyncio.Lock
+        self.voice_connect_cooldowns = {}  # guild_id: unix timestamp
 
     def _is_enabled(self) -> bool:
         """Whether music commands should be active."""
@@ -176,6 +178,35 @@ class Music(commands.Cog):
     def _get_volume(self, guild_id: int) -> float:
         """Return saved guild volume as a 0.0-1.0 value."""
         return self.volumes.get(guild_id, 0.5)
+
+    def _voice_connect_retry_after(self, guild_id: int) -> int:
+        """Return seconds remaining before another voice connect attempt is allowed."""
+        retry_at = self.voice_connect_cooldowns.get(guild_id, 0)
+        remaining = int(retry_at - discord.utils.utcnow().timestamp())
+        return max(0, remaining)
+
+    def _set_voice_connect_cooldown(self, guild_id: int) -> None:
+        """Briefly throttle voice attempts after Discord rejects a voice session."""
+        retry_at = discord.utils.utcnow().timestamp() + VOICE_CONNECT_COOLDOWN_SECONDS
+        self.voice_connect_cooldowns[guild_id] = retry_at
+
+    async def _cleanup_voice_client(self, guild: discord.Guild) -> None:
+        """Clear stale voice state after a failed Discord voice handshake."""
+        voice_client = guild.voice_client
+        if voice_client is None:
+            return
+
+        try:
+            await voice_client.disconnect(force=True)
+        except Exception as error:
+            logger.warning("Failed to disconnect stale music voice client in guild %s: %s", guild.id, error)
+
+        cleanup = getattr(voice_client, "cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception as error:
+                logger.warning("Failed to cleanup stale music voice client in guild %s: %s", guild.id, error)
 
     def _get_youtube_player_clients(self) -> list[str]:
         """Resolve the YouTube clients yt-dlp should try for public playback."""
@@ -307,6 +338,11 @@ class Music(commands.Cog):
             return None
 
         voice_client = interaction.guild.voice_client
+        if voice_client and not voice_client.is_connected():
+            logger.warning("Cleaning up stale music voice client in guild %s before reconnecting", interaction.guild.id)
+            await self._cleanup_voice_client(interaction.guild)
+            voice_client = interaction.guild.voice_client
+
         if voice_client and voice_client.channel != voice_state.channel:
             await voice_client.move_to(voice_state.channel)
             return voice_client
@@ -314,11 +350,30 @@ class Music(commands.Cog):
         if voice_client:
             return voice_client
 
+        retry_after = self._voice_connect_retry_after(interaction.guild.id)
+        if retry_after:
+            sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+            await sender(
+                embed=EmbedFactory.error(
+                    "Voice Connection Cooling Down",
+                    (
+                        "Discord rejected the last voice connection attempt. "
+                        f"Please wait about {retry_after}s before trying again."
+                    )
+                ),
+                ephemeral=True
+            )
+            return None
+
         try:
-            voice_client = await voice_state.channel.connect(reconnect=False, timeout=20.0)
+            voice_client = await voice_state.channel.connect(reconnect=True, timeout=30.0)
             logger.info("Music voice connected in guild %s to channel %s", interaction.guild.id, voice_state.channel.id)
             return voice_client
         except Exception as error:
+            await self._cleanup_voice_client(interaction.guild)
+            if isinstance(error, discord.ConnectionClosed) and getattr(error, "code", None) == 4006:
+                self._set_voice_connect_cooldown(interaction.guild.id)
+
             logger.error(
                 "Music voice connection failed in guild %s to channel %s: %s",
                 interaction.guild.id,
@@ -326,9 +381,15 @@ class Music(commands.Cog):
                 error,
                 exc_info=True
             )
+            error_message = (
+                "Discord rejected the voice session handshake. I cleaned up the stale voice state; "
+                "please try again in about 45 seconds."
+                if isinstance(error, discord.ConnectionClosed) and getattr(error, "code", None) == 4006
+                else f"Could not join voice channel: {error}"
+            )
             sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
             await sender(
-                embed=EmbedFactory.error("Connection Failed", f"Could not join voice channel: {error}"),
+                embed=EmbedFactory.error("Connection Failed", error_message),
                 ephemeral=True
             )
             return None
