@@ -11,8 +11,11 @@ import logging
 import asyncio
 import functools
 import shutil
+import os
+from urllib.parse import urlparse
 
 import yt_dlp
+from yt_dlp.utils import DownloadError
 
 from utils.embeds import EmbedFactory, EmbedColor
 from utils.permissions import is_admin
@@ -22,13 +25,15 @@ logger = logging.getLogger(__name__)
 
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
-    "default_search": "ytsearch",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "extract_flat": False,
+    "ignoreerrors": True,
+    "geo_bypass": True,
     "source_address": "0.0.0.0"
 }
+DEFAULT_YOUTUBE_PLAYER_CLIENTS = ("tv", "web_safari", "android")
 FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
 
@@ -144,7 +149,6 @@ class Music(commands.Cog):
         self.module_config = config.get('modules', {}).get('music', {})
         self.queues = {}  # guild_id: MusicQueue
         self.volumes = {}  # guild_id: float
-        self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
     def _is_enabled(self) -> bool:
         """Whether music commands should be active."""
@@ -172,6 +176,37 @@ class Music(commands.Cog):
         """Return saved guild volume as a 0.0-1.0 value."""
         return self.volumes.get(guild_id, 0.5)
 
+    def _get_youtube_player_clients(self) -> list[str]:
+        """Resolve the YouTube clients yt-dlp should try for public playback."""
+        configured = (
+            os.getenv("YOUTUBE_PLAYER_CLIENTS")
+            or self.module_config.get("youtube_player_clients")
+            or ",".join(DEFAULT_YOUTUBE_PLAYER_CLIENTS)
+        )
+        clients = [client.strip() for client in str(configured).split(",") if client.strip()]
+        return clients or list(DEFAULT_YOUTUBE_PLAYER_CLIENTS)
+
+    def _get_youtube_cookiefile(self) -> Optional[str]:
+        """Optional cookie file path for hosts that YouTube has challenged."""
+        cookiefile = os.getenv("YOUTUBE_COOKIES_FILE") or self.module_config.get("youtube_cookies_file")
+        if not cookiefile:
+            return None
+        return str(cookiefile)
+
+    def _build_ytdl(self, player_clients: list[str]) -> yt_dlp.YoutubeDL:
+        """Create a fresh yt-dlp instance for one extraction attempt."""
+        options = dict(YTDL_OPTIONS)
+        options["extractor_args"] = {"youtube": {"player_client": player_clients}}
+        cookiefile = self._get_youtube_cookiefile()
+        if cookiefile:
+            options["cookiefile"] = cookiefile
+        return yt_dlp.YoutubeDL(options)
+
+    def _looks_like_url(self, value: str) -> bool:
+        """Detect direct URLs so search terms can use broader fallback search."""
+        parsed = urlparse(value.strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
     def get_queue(self, guild_id: int) -> MusicQueue:
         """Get or create queue for guild"""
         if guild_id not in self.queues:
@@ -180,15 +215,13 @@ class Music(commands.Cog):
 
     async def _extract_track(self, query: str, requester: discord.Member) -> dict:
         """Resolve a search query or URL into a playable audio stream."""
-        loop = self.bot.loop
-        extractor = functools.partial(self.ytdl.extract_info, query, download=False)
-        data = await loop.run_in_executor(None, extractor)
+        data = await self._extract_info_with_fallbacks(query)
 
         if "entries" in data:
             entries = [entry for entry in data.get("entries", []) if entry]
             if not entries:
                 raise ValueError("No playable results were found for that search.")
-            data = entries[0]
+            data = next((entry for entry in entries if entry.get("url")), entries[0])
 
         stream_url = data.get("url")
         if not stream_url:
@@ -203,6 +236,49 @@ class Music(commands.Cog):
             "requester_id": requester.id,
             "requester_name": requester.display_name
         }
+
+    async def _extract_info_with_fallbacks(self, query: str) -> dict:
+        """Try YouTube extraction with public clients and search fallback."""
+        search_terms = [query] if self._looks_like_url(query) else [f"ytsearch5:{query}"]
+        player_clients = self._get_youtube_player_clients()
+        client_attempts = [
+            player_clients,
+            ["tv", "web_safari"],
+            ["android"],
+            ["web"]
+        ]
+        seen_attempts = set()
+        last_error = None
+
+        for clients in client_attempts:
+            attempt_key = tuple(clients)
+            if attempt_key in seen_attempts:
+                continue
+            seen_attempts.add(attempt_key)
+
+            ytdl = self._build_ytdl(clients)
+            for term in search_terms:
+                try:
+                    extractor = functools.partial(ytdl.extract_info, term, download=False)
+                    loop = asyncio.get_running_loop()
+                    data = await loop.run_in_executor(None, extractor)
+                    if data:
+                        return data
+                except DownloadError as error:
+                    last_error = str(error)
+                    logger.warning("yt-dlp failed for %s with YouTube clients %s: %s", term, ",".join(clients), error)
+                except Exception as error:
+                    last_error = str(error)
+                    logger.warning("Music extraction failed for %s with YouTube clients %s: %s", term, ",".join(clients), error)
+
+        if last_error and "Sign in to confirm" in last_error:
+            raise ValueError(
+                "YouTube blocked this public extraction with its anti-bot check. "
+                "Try searching by song title instead of using the direct link; if it keeps happening on Railway, "
+                "we'll need either a different audio source or a `YOUTUBE_COOKIES_FILE` configured."
+            )
+
+        raise ValueError(last_error or "No playable results were found for that search.")
 
     async def _ensure_voice_client(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
         """Join or move to the requester's voice channel."""
@@ -325,10 +401,6 @@ class Music(commands.Cog):
 
         await interaction.response.defer()
 
-        voice_client = await self._ensure_voice_client(interaction)
-        if voice_client is None:
-            return
-
         try:
             track = await self._extract_track(query, interaction.user)
         except Exception as error:
@@ -337,6 +409,10 @@ class Music(commands.Cog):
                 embed=EmbedFactory.error("Track Not Found", str(error)),
                 ephemeral=True
             )
+            return
+
+        voice_client = await self._ensure_voice_client(interaction)
+        if voice_client is None:
             return
 
         # Add to queue

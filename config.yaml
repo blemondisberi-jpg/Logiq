@@ -63,6 +63,8 @@ modules:
 
   music:
     enabled: true
+    youtube_player_clients: "tv,web_safari,android"
+    youtube_cookies_file: ""
 
   tickets:
     enabled: true
