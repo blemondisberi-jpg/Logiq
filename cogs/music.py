@@ -12,6 +12,7 @@ import asyncio
 import functools
 import shutil
 import os
+import uuid
 from urllib.parse import urlparse
 
 import yt_dlp
@@ -318,7 +319,11 @@ class Music(commands.Cog):
 
         raise ValueError(last_error or "No playable results were found for that search.")
 
-    async def _ensure_voice_client(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
+    async def _ensure_voice_client(
+        self,
+        interaction: discord.Interaction,
+        attempt_id: Optional[str] = None
+    ) -> Optional[discord.VoiceClient]:
         """Join or move to the requester's voice channel."""
         if interaction.guild is None:
             sender = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
@@ -339,15 +344,32 @@ class Music(commands.Cog):
 
         voice_client = interaction.guild.voice_client
         if voice_client and not voice_client.is_connected():
-            logger.warning("Cleaning up stale music voice client in guild %s before reconnecting", interaction.guild.id)
+            logger.warning(
+                "Music attempt %s: cleaning up stale voice client in guild %s before reconnecting",
+                attempt_id,
+                interaction.guild.id
+            )
             await self._cleanup_voice_client(interaction.guild)
             voice_client = interaction.guild.voice_client
 
         if voice_client and voice_client.channel != voice_state.channel:
+            logger.info(
+                "Music attempt %s: moving voice client in guild %s from channel %s to %s",
+                attempt_id,
+                interaction.guild.id,
+                getattr(voice_client.channel, "id", None),
+                voice_state.channel.id
+            )
             await voice_client.move_to(voice_state.channel)
             return voice_client
 
         if voice_client:
+            logger.info(
+                "Music attempt %s: reusing existing voice client in guild %s channel %s",
+                attempt_id,
+                interaction.guild.id,
+                getattr(voice_client.channel, "id", None)
+            )
             return voice_client
 
         retry_after = self._voice_connect_retry_after(interaction.guild.id)
@@ -366,8 +388,19 @@ class Music(commands.Cog):
             return None
 
         try:
-            voice_client = await voice_state.channel.connect(reconnect=True, timeout=30.0)
-            logger.info("Music voice connected in guild %s to channel %s", interaction.guild.id, voice_state.channel.id)
+            logger.info(
+                "Music attempt %s: connecting voice in guild %s to channel %s",
+                attempt_id,
+                interaction.guild.id,
+                voice_state.channel.id
+            )
+            voice_client = await voice_state.channel.connect(reconnect=False, timeout=30.0)
+            logger.info(
+                "Music attempt %s: voice connected in guild %s to channel %s",
+                attempt_id,
+                interaction.guild.id,
+                voice_state.channel.id
+            )
             return voice_client
         except Exception as error:
             await self._cleanup_voice_client(interaction.guild)
@@ -375,7 +408,8 @@ class Music(commands.Cog):
                 self._set_voice_connect_cooldown(interaction.guild.id)
 
             logger.error(
-                "Music voice connection failed in guild %s to channel %s: %s",
+                "Music attempt %s: voice connection failed in guild %s to channel %s: %s",
+                attempt_id,
                 interaction.guild.id,
                 voice_state.channel.id,
                 error,
@@ -410,27 +444,28 @@ class Music(commands.Cog):
         url = track.get("webpage_url")
         return f"[{title}]({url})" if url else title
 
-    async def _play_next(self, guild_id: int) -> None:
-        """Start the next queued track, disconnecting when the queue is empty."""
+    async def _play_next(self, guild_id: int, attempt_id: Optional[str] = None) -> tuple[bool, Optional[str]]:
+        """Start the next queued track and report whether playback actually began."""
         async with self.get_playback_lock(guild_id):
             guild = self.bot.get_guild(guild_id)
             if guild is None or guild.voice_client is None:
-                return
+                return False, "I am not connected to a voice channel."
 
             voice_client = guild.voice_client
             if not voice_client.is_connected():
                 logger.warning("Music playback requested in guild %s but voice client is disconnected", guild_id)
-                return
+                return False, "The voice connection dropped before playback could start."
 
             if voice_client.is_playing() or voice_client.is_paused():
-                return
+                return True, None
 
             queue = self.get_queue(guild_id)
             track = queue.next()
             if not track:
                 queue.current = None
                 logger.info("Music queue empty in guild %s", guild_id)
-                return
+                return False, "The music queue is empty."
+            attempt_id = attempt_id or track.get("attempt_id")
 
             try:
                 source = discord.FFmpegPCMAudio(
@@ -442,15 +477,22 @@ class Music(commands.Cog):
             except Exception as error:
                 queue.current = None
                 logger.error(
-                    "Failed to create FFmpeg audio source in guild %s for %s: %s",
+                    "Music attempt %s: failed to create FFmpeg audio source in guild %s for %s: %s",
+                    attempt_id,
                     guild_id,
                     track.get("webpage_url") or track.get("title"),
                     error,
                     exc_info=True
                 )
-                return
+                return False, "I could not create the audio stream for that track."
 
             def after_play(error: Optional[Exception]) -> None:
+                logger.info(
+                    "Music attempt %s: after_play callback fired in guild %s with error=%s",
+                    attempt_id,
+                    guild_id,
+                    error
+                )
                 future = asyncio.run_coroutine_threadsafe(
                     self._handle_track_finished(guild_id, track, error),
                     self.bot.loop
@@ -467,20 +509,24 @@ class Music(commands.Cog):
             try:
                 voice_client.play(audio, after=after_play)
                 logger.info(
-                    "Music playback started in guild %s: %s (%s)",
+                    "Music attempt %s: playback started in guild %s: %s (%s)",
+                    attempt_id,
                     guild_id,
                     track.get("title"),
                     track.get("webpage_url")
                 )
+                return True, None
             except Exception as error:
                 queue.current = None
                 logger.error(
-                    "Failed to start music playback in guild %s for %s: %s",
+                    "Music attempt %s: failed to start playback in guild %s for %s: %s",
+                    attempt_id,
                     guild_id,
                     track.get("webpage_url") or track.get("title"),
                     error,
                     exc_info=True
                 )
+                return False, "Discord accepted the voice connection, but playback could not be started."
 
     async def _handle_track_finished(
         self,
@@ -504,20 +550,27 @@ class Music(commands.Cog):
         queue.current = None
         await self._play_next(guild_id)
 
-    async def _start_playback_if_idle(self, guild_id: int) -> None:
-        """Kick the queue if the voice client is idle."""
+    async def _start_playback_if_idle(
+        self,
+        guild_id: int,
+        attempt_id: Optional[str] = None
+    ) -> tuple[bool, Optional[str]]:
+        """Kick the queue if the voice client is idle and report the result."""
         guild = self.bot.get_guild(guild_id)
         if not guild or not guild.voice_client:
-            return
+            return False, "I am not connected to a voice channel."
 
         voice_client = guild.voice_client
         if not voice_client.is_playing() and not voice_client.is_paused():
-            await self._play_next(guild_id)
+            return await self._play_next(guild_id, attempt_id=attempt_id)
+
+        return True, None
 
     @app_commands.command(name="play", description="Play music from YouTube")
     @app_commands.describe(query="Song name or YouTube URL")
     async def play(self, interaction: discord.Interaction, query: str):
         """Play music from YouTube"""
+        attempt_id = uuid.uuid4().hex[:8]
         if not await self._guard_enabled(interaction):
             return
 
@@ -536,7 +589,17 @@ class Music(commands.Cog):
             )
             return
 
+        logger.info(
+            "Music attempt %s: /play requested in guild %s by user %s in channel %s with query %r",
+            attempt_id,
+            interaction.guild.id,
+            interaction.user.id,
+            voice_state.channel.id,
+            query
+        )
+
         if not self._ffmpeg_available():
+            logger.error("Music attempt %s: FFmpeg missing on host", attempt_id)
             await interaction.response.send_message(
                 embed=EmbedFactory.error(
                     "FFmpeg Missing",
@@ -551,28 +614,57 @@ class Music(commands.Cog):
         try:
             track = await self._extract_track(query, interaction.user)
         except Exception as error:
-            logger.error("Failed to resolve music query %s: %s", query, error, exc_info=True)
+            logger.error("Music attempt %s: failed to resolve music query %s: %s", attempt_id, query, error, exc_info=True)
             await interaction.followup.send(
                 embed=EmbedFactory.error("Track Not Found", str(error)),
                 ephemeral=True
             )
             return
         logger.info(
-            "Music track resolved in guild %s by %s: %s (%s)",
+            "Music attempt %s: track resolved in guild %s by %s: %s (%s)",
+            attempt_id,
             interaction.guild.id,
             interaction.user,
             track.get("title"),
             track.get("webpage_url")
         )
+        track["attempt_id"] = attempt_id
 
-        voice_client = await self._ensure_voice_client(interaction)
+        voice_client = await self._ensure_voice_client(interaction, attempt_id=attempt_id)
         if voice_client is None:
             return
 
         # Add to queue
         queue = self.get_queue(interaction.guild.id)
         was_idle = not voice_client.is_playing() and not voice_client.is_paused() and queue.current is None
+        logger.info(
+            "Music attempt %s: queueing track in guild %s; was_idle=%s queue_len_before=%s",
+            attempt_id,
+            interaction.guild.id,
+            was_idle,
+            len(queue.queue)
+        )
         queue.add(track)
+
+        if was_idle:
+            started, playback_error = await self._start_playback_if_idle(interaction.guild.id, attempt_id=attempt_id)
+            if not started:
+                queue.clear()
+                logger.warning(
+                    "Music attempt %s: track resolved but playback did not start in guild %s for %s: %s",
+                    attempt_id,
+                    interaction.guild.id,
+                    track.get("webpage_url") or track.get("title"),
+                    playback_error
+                )
+                await interaction.followup.send(
+                    embed=EmbedFactory.error(
+                        "Playback Failed",
+                        playback_error or "I could not start playback for that track."
+                    ),
+                    ephemeral=True
+                )
+                return
 
         embed = EmbedFactory.success(
             "Now Playing" if was_idle else "Added to Queue",
@@ -585,8 +677,9 @@ class Music(commands.Cog):
             embed.set_thumbnail(url=track["thumbnail"])
 
         await interaction.followup.send(embed=embed, view=MusicControlView(self))
-        await self._start_playback_if_idle(interaction.guild.id)
-        logger.info("Added music track by %s: %s", interaction.user, track["title"])
+        if not was_idle:
+            await self._start_playback_if_idle(interaction.guild.id, attempt_id=attempt_id)
+        logger.info("Music attempt %s: user-facing response sent for %s: %s", attempt_id, interaction.user, track["title"])
 
     @app_commands.command(name="join", description="Join your voice channel")
     async def join(self, interaction: discord.Interaction):
